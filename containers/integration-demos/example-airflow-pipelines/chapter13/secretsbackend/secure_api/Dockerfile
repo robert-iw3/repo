@@ -1,4 +1,4 @@
-FROM python:3.8.2-slim
+FROM python:3.14.4-slim
 
 RUN pip install Flask~=1.1.2
 COPY app.py /app/app.py
