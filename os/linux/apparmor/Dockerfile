@@ -1,4 +1,4 @@
-FROM ubuntu:25.10
+FROM ubuntu:questing-20250806
 
 RUN apt update && apt install -y \
     apparmor apparmor-utils auditd python3-pip \
