@@ -5,15 +5,17 @@
  * Natively compiles as a C-compatible Dynamic Link Library (cdylib).
  * Implements micro-batched transactional logging and memory-mapped SQLite
  * PRAGMAs to handle massive ETW telemetry firehoses without I/O blocking.
+ * @RW
  *============================================================================================*/
 
 use rusqlite::{Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::os::raw::{c_char};
 use std::sync::Mutex;
+use std::fs::File;
 use regex::RegexSet;
 use zip::ZipArchive;
 
@@ -31,13 +33,13 @@ pub struct DlpConfig {
 fn default_min_samples() -> u64 { 25 }
 fn default_z_score() -> f64 { 3.5 }
 
-#[repr(C)]
+#[derive(Deserialize)]
 pub struct FfiPlatformEvent {
-    pub timestamp: *const c_char,
-    pub user: *const c_char,
-    pub process: *const c_char,
-    pub filepath: *const c_char,
-    pub destination: *const c_char,
+    pub timestamp: String,
+    pub user: String,
+    pub process: String,
+    pub filepath: String,
+    pub destination: String,
     pub bytes: i64,
     pub duration_ms: i64,
 }
@@ -48,6 +50,10 @@ pub struct DlpAlert {
     pub details: String,
     pub confidence: i32,
     pub mitre_tactic: String,
+    pub user: Option<String>,
+    pub process: Option<String>,
+    pub filepath: Option<String>,
+    pub destination: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -64,67 +70,67 @@ pub struct UebaBaseline {
     pub m2_velocity: f64,
 }
 
+// --- NATIVE ENGINE INITIALIZATION ---
+
 pub struct DlpEngine {
     pub db_conn: Connection,
+    pub config: DlpConfig,
+    pub user_baselines: HashMap<String, UebaBaseline>,
     pub regex_set: RegexSet,
     pub patterns: Vec<String>,
-    pub user_baselines: HashMap<String, UebaBaseline>,
-    pub ueba_min_samples: u64,
-    pub ueba_z_score: f64,
 }
-
-// --- FFI EXPORTS ---
 
 #[no_mangle]
 pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpEngine> {
-    if config_json.is_null() { return std::ptr::null_mut(); }
-
-    let c_str = unsafe { CStr::from_ptr(config_json) };
-    let json_str = match c_str.to_str() {
-        Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
-    };
-
-    let config: DlpConfig = serde_json::from_str(json_str).unwrap_or_default();
-
-    let mut all_patterns = config.strict_strings.clone();
-    all_patterns.extend(config.regex_patterns.clone());
-    let regex_set = RegexSet::new(&all_patterns).unwrap();
-
     let secure_dir = r"C:\ProgramData\DataSensor\Data";
     let _ = std::fs::create_dir_all(secure_dir);
-    let db_path = format!(r"{}\DlpLedger.db", secure_dir);
+    let db_path = format!(r"{}\DataLedger.db", secure_dir);
 
     let conn = Connection::open(&db_path).unwrap_or_else(|_| {
-        Connection::open_in_memory().expect("CRITICAL: Failed to initialize SQLite")
+        Connection::open_in_memory().expect("CRITICAL: Failed to initialize SQLite.")
     });
 
     conn.execute_batch("
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        PRAGMA cache_size = -64000;
-        PRAGMA mmap_size = 2147483648;
         PRAGMA temp_store = MEMORY;
+        PRAGMA mmap_size = 4294967296; /* 4GB Memory Map */
         PRAGMA wal_autocheckpoint = 1000;
+    ").expect("Failed to apply high-performance SQLite PRAGMAs.");
 
-        CREATE TABLE IF NOT EXISTS DataLedger (
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS DataLedger (
             Id INTEGER PRIMARY KEY AUTOINCREMENT,
             Timestamp TEXT,
+            User TEXT,
             Process TEXT,
             FilePath TEXT,
             Destination TEXT,
             Bytes INTEGER,
             Velocity REAL
-        );
-    ").expect("Failed to apply performance pragmas and schema");
+        )",
+        []
+    ).expect("Failed to initialize DataLedger schema.");
+
+    let mut config = DlpConfig::default();
+    if !config_json.is_null() {
+        let c_str = unsafe { CStr::from_ptr(config_json) };
+        if let Ok(json_str) = c_str.to_str() {
+            if let Ok(parsed) = serde_json::from_str::<DlpConfig>(json_str) {
+                config = parsed;
+            }
+        }
+    }
+
+    let regex_set = RegexSet::new(&config.regex_patterns).unwrap_or_else(|_| RegexSet::empty());
+    let patterns = config.regex_patterns.clone();
 
     let engine = DlpEngine {
         db_conn: conn,
-        regex_set,
-        patterns: all_patterns,
+        config,
         user_baselines: HashMap::new(),
-        ueba_min_samples: config.ueba_min_samples,
-        ueba_z_score: config.ueba_z_score,
+        regex_set,
+        patterns,
     };
 
     Box::into_raw(Box::new(Mutex::new(engine)))
@@ -133,31 +139,55 @@ pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpE
 #[no_mangle]
 pub extern "C" fn process_telemetry_batch(
     engine_ptr: *mut Mutex<DlpEngine>,
-    events_ptr: *const FfiPlatformEvent,
-    event_count: usize,
+    batch_json: *const c_char,
 ) -> *mut c_char {
-    let engine_guard = unsafe { &*engine_ptr };
-    let mut engine = match engine_guard.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    if engine_ptr.is_null() || batch_json.is_null() {
+        return std::ptr::null_mut();
+    }
 
-    let events_slice = unsafe { std::slice::from_raw_parts(events_ptr, event_count) };
+    let engine_mutex = unsafe { &*engine_ptr };
+    let mut engine_guard = match engine_mutex.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+
+    let engine = &mut *engine_guard;
+
+    let json_str = unsafe { CStr::from_ptr(batch_json).to_string_lossy() };
+    let events_slice: Vec<FfiPlatformEvent> = serde_json::from_str(&json_str).unwrap_or_default();
     let mut alerts = Vec::new();
 
     let tx = engine.db_conn.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
     {
         let mut stmt = match tx.prepare_cached(
-            "INSERT INTO DataLedger (Timestamp, Process, FilePath, Destination, Bytes, Velocity) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            "INSERT INTO DataLedger (Timestamp, User, Process, FilePath, Destination, Bytes, Velocity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         ) {
             Ok(s) => s,
             Err(e) => return make_error_response(&format!("SQL Prepare Error: {}", e)),
         };
 
         for ffi_evt in events_slice {
-            let ts = unsafe { CStr::from_ptr(ffi_evt.timestamp).to_string_lossy().into_owned() };
-            let usr = unsafe { CStr::from_ptr(ffi_evt.user).to_string_lossy().into_owned() };
-            let proc = unsafe { CStr::from_ptr(ffi_evt.process).to_string_lossy().into_owned() };
-            let path = unsafe { CStr::from_ptr(ffi_evt.filepath).to_string_lossy().into_owned() };
-            let dest = unsafe { CStr::from_ptr(ffi_evt.destination).to_string_lossy().into_owned() };
+            let ts = ffi_evt.timestamp.clone();
+            let usr = ffi_evt.user.clone();
+            let proc = ffi_evt.process.clone();
+            let path = ffi_evt.filepath.clone();
+            let dest = ffi_evt.destination.clone();
             let bytes = ffi_evt.bytes;
+
+            if dest != "Disk_Write" && dest != "Clipboard" {
+                for strict_term in &engine.config.strict_strings {
+                    if dest.contains(strict_term) {
+                        alerts.push(DlpAlert {
+                            alert_type: "NETWORK_INTEL_VIOLATION".to_string(),
+                            details: format!("Outbound connection to Threat Intel Indicator: {}", strict_term),
+                            user: Some(usr.clone()),
+                            process: Some(proc.clone()),
+                            filepath: Some(path.clone()),
+                            destination: Some(dest.clone()),
+                            confidence: 100,
+                            mitre_tactic: "T1048 - Exfiltration Over Alternative Protocol".to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
 
             let velocity = if ffi_evt.duration_ms > 0 {
                 (bytes as f64 / ffi_evt.duration_ms as f64) * 1000.0
@@ -165,7 +195,7 @@ pub extern "C" fn process_telemetry_batch(
                 bytes as f64
             };
 
-            let _ = stmt.execute(rusqlite::params![ts, proc, path, dest, bytes, velocity]);
+            let _ = stmt.execute(rusqlite::params![ts, usr, proc, path, dest, bytes, velocity]);
 
             let baseline_key = format!("{}|{}", usr, dest);
             let baseline = engine.user_baselines.entry(baseline_key).or_insert(UebaBaseline {
@@ -183,17 +213,21 @@ pub extern "C" fn process_telemetry_batch(
             baseline.mean_velocity += delta_v / n;
             baseline.m2_velocity += delta_v * (velocity - baseline.mean_velocity);
 
-            if baseline.count > engine.ueba_min_samples {
+            if baseline.count > engine.config.ueba_min_samples {
                 let std_dev_b = (baseline.m2_bytes / n).sqrt();
                 let std_dev_v = (baseline.m2_velocity / n).sqrt();
 
                 let z_score_b = if std_dev_b > 0.0 { (bytes as f64 - baseline.mean_bytes) / std_dev_b } else { 0.0 };
                 let z_score_v = if std_dev_v > 0.0 { (velocity - baseline.mean_velocity) / std_dev_v } else { 0.0 };
 
-                if z_score_b > engine.ueba_z_score || z_score_v > engine.ueba_z_score {
+                if z_score_b > engine.config.ueba_z_score || z_score_v > engine.config.ueba_z_score {
                     alerts.push(DlpAlert {
                         alert_type: "UEBA_ANOMALY".to_string(),
                         details: format!("Z-Score (Vol: {:.2}, Vel: {:.2}) | Bytes: {} | Velocity: {:.2} B/s", z_score_b, z_score_v, bytes, velocity),
+                        user: Some(usr.clone()),
+                        process: Some(proc.clone()),
+                        filepath: Some(path.clone()),
+                        destination: Some(dest.clone()),
                         confidence: 90,
                         mitre_tactic: "T1048 - Exfiltration Over Alternative Protocol".to_string(),
                     });
@@ -212,55 +246,81 @@ pub extern "C" fn process_telemetry_batch(
 #[no_mangle]
 pub extern "C" fn inspect_file_content(
     engine_ptr: *mut Mutex<DlpEngine>,
-    file_path: *const c_char,
     file_ext: *const c_char,
-    buffer: *const u8,
-    buffer_len: usize,
+    filepath: *const c_char,
+    process_name: *const c_char,
+    user_name: *const c_char,
 ) -> *mut c_char {
-    let engine_guard = unsafe { &*engine_ptr };
-    let engine = match engine_guard.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    if engine_ptr.is_null() || filepath.is_null() {
+        return std::ptr::null_mut();
+    }
 
-    let slice = unsafe { std::slice::from_raw_parts(buffer, buffer_len) };
-    let ext_str = unsafe { CStr::from_ptr(file_ext).to_string_lossy().to_lowercase() };
+    let path_str = unsafe { CStr::from_ptr(filepath).to_string_lossy().into_owned() };
+    let ext_str = if file_ext.is_null() { String::new() } else { unsafe { CStr::from_ptr(file_ext).to_string_lossy().to_lowercase() } };
+    let proc_str = if process_name.is_null() { "System".to_string() } else { unsafe { CStr::from_ptr(process_name).to_string_lossy().into_owned() } };
+    let usr_str = if user_name.is_null() { "System".to_string() } else { unsafe { CStr::from_ptr(user_name).to_string_lossy().into_owned() } };
+
+    let mut file = match File::open(&path_str) {
+        Ok(f) => f,
+        Err(_) => return std::ptr::null_mut(), // File securely locked by OS, skip cleanly
+    };
 
     let mut extracted_text = String::new();
 
     if ext_str == ".zip" || ext_str == ".docx" || ext_str == ".xlsx" || ext_str == ".pptx" {
-        if let Ok(mut archive) = ZipArchive::new(Cursor::new(slice)) {
+        if let Ok(mut archive) = ZipArchive::new(&mut file) {
+            let mut total_extracted_bytes = 0;
             for i in 0..archive.len() {
-                if let Ok(file) = archive.by_index(i) {
-                    if file.name().ends_with(".xml") || file.name().ends_with(".txt") {
+                if let Ok(archive_file) = archive.by_index(i) {
+                    if archive_file.name().ends_with(".xml") || archive_file.name().ends_with(".txt") {
                         let mut contents = String::new();
-                        let mut limit_reader = file.take(5 * 1024 * 1024);
-                        let _ = limit_reader.read_to_string(&mut contents);
+                        let mut limit_reader = archive_file.take(5 * 1024 * 1024);
+                        let bytes_read = limit_reader.read_to_string(&mut contents).unwrap_or(0);
                         extracted_text.push_str(&contents);
+
+                        total_extracted_bytes += bytes_read;
+                        if total_extracted_bytes > 25 * 1024 * 1024 {
+                            break;
+                        }
                     }
                 }
             }
         }
     } else {
-        extracted_text = String::from_utf8_lossy(slice).into_owned();
+        let mut limit_reader = file.take(15 * 1024 * 1024);
+        let _ = limit_reader.read_to_string(&mut extracted_text);
     }
 
-    let mut byte_counts = [0usize; 256];
-    for &b in slice { byte_counts[b as usize] += 1; }
-    let entropy = byte_counts.iter().fold(0.0, |acc, &count| {
-        if count == 0 { acc } else {
-            let p = count as f64 / buffer_len as f64;
-            acc - p * p.log2()
-        }
-    });
+    let engine_guard = unsafe { &*engine_ptr };
+    let engine = match engine_guard.lock() { Ok(g) => g, Err(p) => p.into_inner() };
 
     let mut alerts = Vec::new();
     let matches: Vec<_> = engine.regex_set.matches(&extracted_text).into_iter().collect();
 
-    if !matches.is_empty() {
-        for &m in &matches {
+    for &m in &matches {
+        alerts.push(DlpAlert {
+            alert_type: "CONTENT_VIOLATION".to_string(),
+            details: format!("Matched Signature: {}", engine.patterns[m]),
+            user: Some(usr_str.clone()),
+            process: Some(proc_str.clone()),
+            filepath: Some(path_str.clone()),
+            destination: Some("Deep_Inspection".to_string()),
+            confidence: 100,
+            mitre_tactic: "T1567 - Exfiltration Over Web Service".to_string(),
+        });
+    }
+
+    for strict_term in &engine.config.strict_strings {
+        if extracted_text.contains(strict_term) {
             alerts.push(DlpAlert {
-                alert_type: "CONTENT_VIOLATION".to_string(),
-                details: format!("Matched Signature: {} | File Entropy: {:.2}", engine.patterns[m], entropy),
+                alert_type: "INTEL_VIOLATION".to_string(),
+                details: format!("Matched Exact Term: {}", strict_term),
+                user: Some(usr_str.clone()),
+                process: Some(proc_str.clone()),
+                filepath: Some(path_str.clone()),
+                destination: Some("Deep_Inspection".to_string()),
                 confidence: 100,
-                mitre_tactic: "T1567 - Exfiltration Over Web Service".to_string(),
+                mitre_tactic: "T1048 - Exfiltration Over Alternative Protocol".to_string(),
             });
         }
     }
@@ -269,7 +329,11 @@ pub extern "C" fn inspect_file_content(
         let mut final_alerts = alerts;
         final_alerts.push(DlpAlert {
             alert_type: "ACTION_REQUIRED".to_string(),
-            details: "SUSPEND_THREAD".to_string(),
+            details: "CONTAINMENT_REQUIRED".to_string(),
+            user: Some(usr_str.clone()),
+            process: Some(proc_str.clone()),
+            filepath: Some(path_str.clone()),
+            destination: Some("Deep_Inspection".to_string()),
             confidence: 100,
             mitre_tactic: "T1485 - Data Destruction / Mitigation".to_string(),
         });

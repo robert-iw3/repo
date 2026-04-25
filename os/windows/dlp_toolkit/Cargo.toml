@@ -2,7 +2,7 @@
 name = "data_sensor_ml"
 version = "0.2.0"
 edition = "2021"
-author = ["Robert Weber"]
+authors = ["Robert Weber"]
 description = "Native FFI UEBA & Content Inspection Engine"
 
 [lib]
