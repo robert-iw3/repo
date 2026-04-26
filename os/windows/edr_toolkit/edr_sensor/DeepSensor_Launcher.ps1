@@ -606,7 +606,12 @@ function Start-DeepSensorHUD {
     <body>
         <div id="app-container" style="display:flex; flex-direction:column; height:100%;">
             <div class="header">
-                <h1>Deep Sensor <span>HUD</span></h1>
+                <div style="display: flex; flex-direction: column;">
+                    <h1>Deep Sensor <span>HUD</span></h1>
+                    <span style="font-family: 'Consolas', monospace; font-size: 0.75rem; color: var(--neon-orange); text-transform: uppercase; margin-top: 5px;">
+                        [!] Only the last 500 events are rendered | Session auto-terminates after 120s of inactivity [!]
+                    </span>
+                </div>
                 <div class="btn-group">
                     <div class="live-indicator" id="apiStatus"><div class="pulse"></div> Auto-Tailing API</div>
                     <label class="custom-file-upload">
@@ -811,10 +816,15 @@ function Start-DeepSensorHUD {
                     const json = await response.json();
                     const newTotal = json.core.length + json.ueba.length;
 
-                    if (newTotal !== totalCount) {
-                        coreData = json.core; uebaData = json.ueba; totalCount = newTotal;
-                        document.getElementById('count-core').innerText = coreData.length;
-                        document.getElementById('count-ueba').innerText = uebaData.length;
+                    const latestEventStr = newTotal > 0 ? JSON.stringify(json.core[json.core.length - 1] || json.ueba[json.ueba.length - 1]) : "";
+
+                    if (newTotal !== totalCount || latestEventStr !== window.lastItemTracker) {
+                        coreData = json.core; uebaData = json.ueba;
+                        totalCount = newTotal;
+                        window.lastItemTracker = latestEventStr;
+
+                        document.getElementById('count-core').innerText = coreData.length >= 200 ? '200+' : coreData.length;
+                        document.getElementById('count-ueba').innerText = uebaData.length >= 200 ? '200+' : uebaData.length;
                         renderTable();
                     }
                 } catch (err) {
@@ -827,7 +837,6 @@ function Start-DeepSensorHUD {
                                 <p style='color:#8b949e; margin-top:20px; font-style:italic;'>Closing tab...</p>
                             </div>
                         `;
-                        // Gracefully terminate the current tab without disrupting the entire browser session
                         setTimeout(() => {
                             window.opener = null;
                             window.open('', '_self');
@@ -868,7 +877,7 @@ function Start-DeepSensorHUD {
 
             while (-not $WaitResult) {
                 $WaitResult = $ContextAsync.AsyncWaitHandle.WaitOne(2000)
-                if (-not $WaitResult -and ((Get-Date) - $LastHit).TotalSeconds -gt 10) {
+                if (-not $WaitResult -and ((Get-Date) - $LastHit).TotalSeconds -gt 120) {
                     $Listener.Stop()
                     return # Auto-terminate: Browser tab was closed
                 }
@@ -908,9 +917,16 @@ function Start-DeepSensorHUD {
                         try {
                             $fs = New-Object System.IO.FileStream($Log.Value, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
                             $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)
+
+                            $tempLines = [System.Collections.Generic.List[string]]::new()
                             while (-not $sr.EndOfStream) {
                                 $line = $sr.ReadLine()
-                                if ($line.Trim().StartsWith("{")) { $Payload[$Log.Key].Add($line) }
+                                if ($line.Trim().StartsWith("{")) { $tempLines.Add($line) }
+                            }
+
+                            $startIndex = [math]::Max(0, $tempLines.Count - 500)
+                            for ($i = $startIndex; $i -lt $tempLines.Count; $i++) {
+                                $Payload[$Log.Key].Add($tempLines[$i])
                             }
                         } catch {
                         } finally {

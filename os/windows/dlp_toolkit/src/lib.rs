@@ -44,7 +44,7 @@ pub struct FfiPlatformEvent {
     pub duration_ms: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct DlpAlert {
     pub alert_type: String,
     pub details: String,
@@ -325,15 +325,19 @@ pub extern "C" fn inspect_file_content(
         }
     }
 
-    if alerts.iter().any(|a| a.confidence == 100) {
+    if let Some(trigger) = alerts.iter().find(|a| a.confidence == 100).cloned() {
         let mut final_alerts = alerts;
+
+        let safe_file = trigger.filepath.clone().unwrap_or_else(|| "Unknown_Vector".to_string());
+        let safe_dest = trigger.destination.clone().unwrap_or_else(|| "Unknown_Target".to_string());
+
         final_alerts.push(DlpAlert {
             alert_type: "ACTION_REQUIRED".to_string(),
-            details: "CONTAINMENT_REQUIRED".to_string(),
-            user: Some(usr_str.clone()),
-            process: Some(proc_str.clone()),
-            filepath: Some(path_str.clone()),
-            destination: Some("Deep_Inspection".to_string()),
+            details: format!("Auto-Containment Enacted | Trigger: {} | Vector: {} -> {}", trigger.details, safe_file, safe_dest),
+            user: trigger.user,
+            process: trigger.process,
+            filepath: Some(safe_file),
+            destination: Some(safe_dest),
             confidence: 100,
             mitre_tactic: "T1485 - Data Destruction / Mitigation".to_string(),
         });

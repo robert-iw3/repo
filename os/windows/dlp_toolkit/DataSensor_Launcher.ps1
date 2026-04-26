@@ -350,9 +350,13 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         "System.ComponentModel.Primitives",
         "System.Private.CoreLib",
         "System.Runtime.InteropServices",
+        "System.IO.FileSystem.DriveInfo",
         "System.Linq",
         "System.Linq.Expressions",
         "System.Text.RegularExpressions",
+        "System.Security.Principal.Windows",
+        "System.Security.Claims",
+        "System.Net.Primitives",
         "netstandard"
     )
 } else {
@@ -530,7 +534,15 @@ function Start-DataSensorHUD {
             <div class="workspace">
                 <div class="table-container">
                     <table>
-                        <thead><tr><th>Timestamp</th><th>Tactic</th><th>Severity</th><th>Process</th><th>Details</th></tr></thead>
+                        <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Tactic</th>
+                            <th>Level</th>
+                            <th>User</th> <th>Process</th>
+                            <th>Message</th>
+                        </tr>
+                        </thead>
                         <tbody id="table-body"></tbody>
                     </table>
                 </div>
@@ -575,10 +587,15 @@ function Start-DataSensorHUD {
                     let timeClean = item.Timestamp ? item.Timestamp.split('T')[1] : '';
                     if (timeClean && timeClean.includes('Z')) timeClean = timeClean.replace('Z','');
 
+                    let actorName = "SYSTEM";
+                    let userMatch = item.Message.match(/User:\s*([^\s|]+)/);
+                    if (userMatch) { actorName = userMatch[1]; }
+
                     tr.innerHTML = `
                         <td>${sanitize(timeClean)}</td>
                         <td style='color:var(--blue)'>${sanitize(item.Tactic)}</td>
                         <td><span class='tag ${tagClass}'>${sanitize(item.Level)}</span></td>
+                        <td style='color:var(--orange); font-weight:600;'>${sanitize(actorName)}</td>
                         <td style='font-weight:600; color:var(--neon-green)'>${sanitize(item.Process)}</td>
                         <td class='mono'>${sanitize(item.Message)}</td>`;
 
@@ -850,10 +867,12 @@ try {
                     $mitre = if ($alert.mitre_tactic) { $alert.mitre_tactic } else { "T1048" }
                     $contextIndicator = if ($alert.details -match "Velocity|Network_Socket") { "NET" } else { "IO " }
 
-                    $LogMsg = "Conviction: $($alert.alert_type) | User: $Identity | Confidence: $($alert.confidence) | $($alert.details)"
+                    $ActionUser = if ($alert.user -and $alert.user -ne "System") { $alert.user } elseif ($evt.UserName) { $evt.UserName } else { $Identity }
+
+                    $LogMsg = "Conviction: $($alert.alert_type) | User: $ActionUser | Confidence: $($alert.confidence) | $($alert.details)"
                     Write-Diag -Message $LogMsg -Level "ALERT" -Tactic $mitre -ProcessName $evt.ProcessName
 
-                    $outMsg = "[$ts] $mitre | $($alert.alert_type) | [$contextIndicator] $Identity@$($evt.ProcessName) | $($alert.details)"
+                    $outMsg = "[$ts] $mitre | $($alert.alert_type) | [$contextIndicator] $ActionUser@$($evt.ProcessName) | $($alert.details)"
 
                     <#
                     .ARCHITECTURAL_ANCHOR 5: SIEM & DATA LAKE FORWARDING
@@ -888,7 +907,7 @@ try {
                     if ($global:AlertQueue.Count -lt 1000) { $global:AlertQueue.Enqueue($outMsg) }
 
                     $RenderColor = if ($alert.confidence -eq 100) { $cRed } else { $cOrange }
-                    Add-AlertMessage "$mitre | $($alert.alert_type) | [$contextIndicator] $Identity@$($evt.ProcessName) | $($alert.details)" $RenderColor
+                    Add-AlertMessage "$mitre | $($alert.alert_type) | [$contextIndicator] $ActionUser@$($evt.ProcessName) | $($alert.details)" $RenderColor
                 }
             }
             elseif ($evt.EventType -eq "DiagLog") {
