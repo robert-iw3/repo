@@ -26,8 +26,9 @@ $LogDir = "C:\ProgramData\DataSensor\Logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $global:LogFile = Join-Path $LogDir "DataSensor_Active.jsonl"
 $global:DiagFile = Join-Path $LogDir "DataSensor_Diagnostic.log"
-
 if (Test-Path $global:DiagFile) { Clear-Content -Path $global:DiagFile -Force -ErrorAction SilentlyContinue }
+$TeardownSig = "C:\ProgramData\DataSensor\Teardown.sig"
+if (Test-Path $TeardownSig) { Remove-Item -Path $TeardownSig -Force -ErrorAction SilentlyContinue }
 
 function Write-EngineDiag([string]$Message, [string]$Level="INFO") {
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
@@ -38,14 +39,14 @@ function Write-EngineDiag([string]$Message, [string]$Level="INFO") {
 Get-ChildItem -Path $LogDir -Filter "*.jsonl" | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-3) } | Remove-Item -Force -ErrorAction SilentlyContinue
 
 function Write-Diag {
-    param([string]$Message, [string]$Level="INFO", [string]$Tactic="None", [string]$ProcessName="System")
+    param([string]$Message, [string]$Level="INFO", [string]$Tactic="None", [string]$ProcessName="System", [hashtable]$Context=@{})
 
     if ((Test-Path $global:LogFile) -and ((Get-Item $global:LogFile).Length -gt 50MB)) {
         $ArchiveName = "DataSensor_$(Get-Date -Format 'yyyyMMdd_HHmmss').jsonl"
         Rename-Item -Path $global:LogFile -NewName $ArchiveName -Force
     }
 
-    $LogObj = [PSCustomObject]@{
+    $LogObj = [ordered]@{
         Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         Level     = $Level
         Component = "Orchestrator"
@@ -54,14 +55,13 @@ function Write-Diag {
         Message   = $Message
     }
 
+    foreach ($key in $Context.Keys) { $LogObj[$key] = $Context[$key] }
+
     $JsonPayload = ($LogObj | ConvertTo-Json -Compress -Depth 5) + "`r`n"
-    try {
-        [System.IO.File]::AppendAllText($global:LogFile, $JsonPayload)
-    } catch {
-        Start-Sleep -Milliseconds 10
-        try { [System.IO.File]::AppendAllText($global:LogFile, $JsonPayload) } catch {}
-    }
+    try { [System.IO.File]::AppendAllText($global:LogFile, $JsonPayload) }
+    catch { Start-Sleep -Milliseconds 10; try { [System.IO.File]::AppendAllText($global:LogFile, $JsonPayload) } catch {} }
 }
+
 Write-Diag "Data Sensor Orchestrator Initialized." "STARTUP"
 
 # ======================================================================
@@ -71,13 +71,6 @@ $global:RecentAlerts = [System.Collections.Generic.List[PSCustomObject]]::new()
 $global:StartupLogs = [System.Collections.Generic.List[string]]::new()
 $global:TotalMitigations = 0
 $global:TotalEvents = 0
-
-function Write-StartupLog([string]$Message) {
-    $ts = (Get-Date).ToString("HH:mm:ss")
-    $global:StartupLogs.Add("[$ts] $Message")
-    if ($global:StartupLogs.Count -gt 10) { $global:StartupLogs.RemoveAt(0) }
-    Draw-StartupWindow
-}
 
 # Disable Windows QuickEdit Mode to prevent accidental process freezing
 $QuickEditCode = @"
@@ -110,10 +103,6 @@ Clear-Host
 # ======================================================================
 # HUD & UI RENDERING ENGINE
 # ======================================================================
-$global:RecentAlerts = [System.Collections.Generic.List[PSCustomObject]]::new()
-$global:StartupLogs = [System.Collections.Generic.List[string]]::new()
-$global:TotalMitigations = 0
-$global:TotalEvents = 0
 
 $ESC      = [char]27
 $cCyan    = "$ESC[38;2;0;255;255m"
@@ -192,7 +181,7 @@ function Draw-AlertWindow {
     }
 
     Write-Host "$cCyan╠══════════════════════════════════════════════════════════════════════════════════════════════════════════╣$cReset"
-    Write-Host "$cCyan║$cReset$cWhite  [ CTRL + C ] INITIATE TEARDOWN SEQUENCE$cReset$($(" " * 64))$cCyan║$cReset"
+    Write-Host "$cCyan║$cReset$cWhite  [ CTRL + C ] INITIATE TEARDOWN SEQUENCE$cReset$($(" " * 65))$cCyan║$cReset"
     Write-Host "$cCyan╚══════════════════════════════════════════════════════════════════════════════════════════════════════════╝$cReset"
     [Console]::SetCursorPosition($curLeft, $curTop)
 }
@@ -249,18 +238,29 @@ $DlpConfig = @{
     ueba_min_samples = 25; ueba_z_score = 3.5;
 }
 
+$currentSection = ""
+
 switch -Regex -File $ConfigPath {
-    "^SensorMode=(.*)$"           { $global:SensorMode = $matches[1].Trim() }
-    "^EnableUniversalLedger=(.*)$" { $global:EnableUniversalLedger = [System.Convert]::ToBoolean($matches[1].Trim()) }
-    "^MaxInspectionSizeMB=(\d+)$" { $MaxInspectionMB = [int]$matches[1] }
-    "^BaselineMinSamples=(\d+)$"  { $DlpConfig.ueba_min_samples = [int]$matches[1] }
-    "^ZScoreTrigger=([\d\.]+)$"   { $DlpConfig.ueba_z_score = [double]$matches[1] }
-    "^TrustedProcesses=(.*)$"     { $TrustedProcs = $matches[1] -split ',' | ForEach-Object { $_.Trim().ToLower() } }
+    "^\[(.*)\]$" {
+        $currentSection = $matches[1].Trim()
+        continue
+    }
+    "^SensorMode=(.*)$"            { $global:SensorMode = $matches[1].Trim(); continue }
+    "^EnableUniversalLedger=(.*)$" { $global:EnableUniversalLedger = [System.Convert]::ToBoolean($matches[1].Trim()); continue }
+    "^MaxInspectionSizeMB=(\d+)$"  { $MaxInspectionMB = [int]$matches[1]; continue }
+    "^BaselineMinSamples=(\d+)$"   { $DlpConfig.ueba_min_samples = [int]$matches[1]; continue }
+    "^ZScoreTrigger=([\d\.]+)$"    { $DlpConfig.ueba_z_score = [double]$matches[1]; continue }
+    "^TrustedProcesses=(.*)$"      { $TrustedProcs = $matches[1] -split ',' | ForEach-Object { $_.Trim().ToLower() }; continue }
+    "^MitigationConfidence=(\d+)$" { $DlpConfig.mitigation_confidence = [int]$matches[1]; continue }
+
     "^([^#;\[][^=]+)=(.*)$" {
-        $key = $matches[1].Trim()
         $val = $matches[2].Trim()
-        if ($key -match "SSN|CreditCard|AWSAccessKey|PrivateRSAKey") { $DlpConfig.regex_patterns += $val }
-        if ($key -match "ProjectNames|Classifications") { $DlpConfig.strict_strings += ($val -split ',') }
+        if ($currentSection -eq "DLP_REGEX") {
+            $DlpConfig.regex_patterns += $val
+        }
+        if ($currentSection -eq "DLP_LITERALS") {
+            $DlpConfig.strict_strings += ($val -split ',' | ForEach-Object { $_.Trim() })
+        }
     }
 }
 
@@ -286,6 +286,11 @@ try {
 
 $ExfiltrationIoCs = Get-ChildItem -Path $IntelDir -Filter "*.txt"
 $TotalIoCs = 0
+
+$strictStringsSet = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]$DlpConfig.strict_strings,
+    [System.StringComparer]::OrdinalIgnoreCase)
+
 foreach ($File in $ExfiltrationIoCs) {
     $IoCs = Get-Content $File.FullName | Where-Object { $_ -match "\S" -and $_ -notmatch "^#" }
     foreach ($IoC in $IoCs) {
@@ -297,7 +302,7 @@ foreach ($File in $ExfiltrationIoCs) {
             try {
                 $ResolvedIPs = [System.Net.Dns]::GetHostAddresses($CleanIoC) | Select-Object -ExpandProperty IPAddressToString
                 foreach ($IP in $ResolvedIPs) {
-                    if ($DlpConfig.strict_strings -notcontains $IP) {
+                    if ($strictStringsSet.Add($IP)) {
                         $DlpConfig.strict_strings += $IP
                         $TotalIoCs++
                     }
@@ -318,7 +323,7 @@ $ManagedDllPath = Join-Path $DependenciesDir "Microsoft.Diagnostics.Tracing.Trac
 if (-not (Test-Path $ManagedDllPath)) {
     Write-Diag "TraceEvent.dll missing. Initiating automatic NuGet acquisition." "WARN"
 
-    $NugetUrl = "https://www.nuget.org/api/v2/package/Microsoft.Diagnostics.Tracing.TraceEvent/3.0.2"
+    $NugetUrl = "https://www.nuget.org/api/v2/package/Microsoft.Diagnostics.Tracing.TraceEvent/3.2.2"
     $ZipPath = Join-Path $DependenciesDir "traceevent.zip"
     $ExtractPath = Join-Path $DependenciesDir "extracted"
 
@@ -350,7 +355,12 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         "System.ComponentModel.Primitives",
         "System.Private.CoreLib",
         "System.Runtime.InteropServices",
+        "System.IO.Compression.FileSystem",
+        "System.IO.Compression.ZipFile",
         "System.IO.FileSystem.DriveInfo",
+        "System.IO.Pipes",
+        "System.IO.Pipes.AccessControl",
+        "System.Security.AccessControl",
         "System.Linq",
         "System.Linq.Expressions",
         "System.Text.RegularExpressions",
@@ -405,8 +415,11 @@ try {
 # --- FFI Bridge Initialization & ACL Lockdown ---
 $BinPath = "C:\ProgramData\DataSensor\Bin"
 $DataPath = "C:\ProgramData\DataSensor\Data"
+$EvidencePath = "C:\ProgramData\DataSensor\Evidence"
+$StagedConfig = "C:\ProgramData\DataSensor\config.ini"
+Copy-Item $ConfigPath -Destination $StagedConfig -Force
 
-foreach ($Dir in @($BinPath, $DataPath)) {
+foreach ($Dir in @($BinPath, $DataPath, $EvidencePath)) {
     if (-not (Test-Path $Dir)) { New-Item -ItemType Directory -Path $Dir -Force | Out-Null }
 
     $Acl = Get-Acl -Path $Dir
@@ -418,15 +431,74 @@ foreach ($Dir in @($BinPath, $DataPath)) {
     Set-Acl -Path $Dir -AclObject $Acl -ErrorAction SilentlyContinue
 }
 
-$RustDllSource = Join-Path $ScriptDir "Bin\DataSensor_ML.dll"
-if (Test-Path $RustDllSource) {
-    Copy-Item $RustDllSource -Destination $BinPath -Force -ErrorAction SilentlyContinue
+# --- COMPILE INGESTION ---
+$NewManifest = Join-Path $ScriptDir "checksums.sha256"
+$NewMlDll    = Join-Path $ScriptDir "DataSensor_ML.dll"
+$NewHookDll  = Join-Path $ScriptDir "DataSensor_Hook.dll"
+
+if ((Test-Path $NewManifest) -and (Test-Path $NewMlDll) -and (Test-Path $NewHookDll)) {
+    Write-Diag "Fresh compiled binaries detected in project root. Migrating to ProgramData." "INFO"
+    Write-StartupLog "[*] New binaries detected. Migrating to secure vault..."
+
+    foreach ($FileName in @("DataSensor_ML.dll", "DataSensor_Hook.dll")) {
+        $Dest = Join-Path $BinPath $FileName
+        if (Test-Path $Dest) {
+            try {
+                Remove-Item -Path $Dest -Force -ErrorAction Stop
+            } catch {
+                $GhostName = "$Dest.locked.$(Get-Date -Format 'HHmmss')"
+                Rename-Item -Path $Dest -NewName $GhostName -Force
+            }
+        }
+    }
+
+    Get-ChildItem -Path $BinPath -Filter "*.locked.*" | Remove-Item -Force -ErrorAction SilentlyContinue
+
+    Move-Item -Path $NewMlDll    -Destination (Join-Path $BinPath "DataSensor_ML.dll") -Force
+    Move-Item -Path $NewHookDll  -Destination (Join-Path $BinPath "DataSensor_Hook.dll") -Force
+    Move-Item -Path $NewManifest -Destination (Join-Path $BinPath "checksums.sha256") -Force
 }
+
+# --- DLL INTEGRITY VERIFICATION ---
+$ManifestPath = Join-Path $BinPath "checksums.sha256"
+if (-not (Test-Path $ManifestPath)) {
+    Write-Host "[-] FATAL: Hash manifest missing. Run Build-RustEngine.ps1 before launching." -ForegroundColor Red
+    Write-Diag "FATAL: checksums.sha256 not found in $BinPath. Refusing to load unverified DLLs." "FATAL"
+    exit
+}
+
+$ManifestLines = Get-Content $ManifestPath | Where-Object { $_ -match '\S' }
+foreach ($line in $ManifestLines) {
+    $parts = $line.Trim() -split '\s+', 2
+    if ($parts.Count -ne 2) { continue }
+    $expectedHash = $parts[0].ToUpper()
+    $dllName      = $parts[1].Trim()
+    $dllPath      = Join-Path $BinPath $dllName
+
+    if (-not (Test-Path $dllPath)) {
+        Write-Host "[-] FATAL: $dllName not found in $BinPath." -ForegroundColor Red
+        Write-Diag "FATAL: $dllName missing from active Bin directory." "FATAL"
+        exit
+    }
+
+    $actualHash = (Get-FileHash -Path $dllPath -Algorithm SHA256).Hash.ToUpper()
+    if ($actualHash -ne $expectedHash) {
+        Write-Host "[-] FATAL: $dllName hash mismatch — binary may be tampered." -ForegroundColor Red
+        Write-Diag "SECURITY ALERT: $dllName hash mismatch. Expected: $expectedHash | Got: $actualHash" "FATAL"
+        exit
+    }
+
+    Write-StartupLog "[+] $dllName integrity verified (SHA256 OK)"
+    Write-Diag "$dllName SHA256 verified: $actualHash" "INFO"
+}
+
 Write-Diag -Message "Anti-Tamper ACLs enforced on secure directories." -Level "INFO"
 Write-StartupLog "Anti-Tamper ACLs enforced on secure directories."
 
 Write-StartupLog "Bootstrapping Native FFI Data Sensor..."
 [RealTimeDataSensor]::InitializeEngine($ConfigJson, $MaxInspectionMB, $TrustedProcsStr, $global:EnableUniversalLedger)
+Write-Diag "Native Rust ML Engine (FFI) successfully mapped into memory." "INFO"
+[RealTimeDataSensor]::InjectExistingProcesses()
 [RealTimeDataSensor]::StartSession()
 
 try { [console]::TreatControlCAsInput = $true } catch {}
@@ -436,6 +508,7 @@ $Script:RunLoop = $true
 $global:TotalAlerts = 0
 $global:LastHeartbeat = [DateTime]::UtcNow
 $global:LastTelemetryReceived = [DateTime]::UtcNow
+$global:LastGroom = $null
 $AlertCache = @{}
 
 <#
@@ -611,8 +684,19 @@ function Start-DataSensorHUD {
                 for (const [key, value] of Object.entries(itemData)) {
                     const row = document.createElement('div');
                     row.className = 'detail-row';
-                    const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : value;
-                    row.innerHTML = `<div class="detail-key">${key}</div><div class="detail-val">${displayValue}</div>`;
+
+                    if (key === 'FilePath' || key === 'filepath') {
+                        const fileName = value.split('\\').pop();
+                        const displayValue = `<div style="display:flex; justify-content:space-between; align-items:center;">
+                            <span style="font-family:'Consolas', monospace; color:var(--text-main); font-size:0.85rem;">${value}</span>
+                            <a href="./api/download/${fileName}" download style="background:var(--blue); color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-weight:bold; font-size:0.75rem; border:1px solid #388bfd; transition:0.2s; cursor:pointer;">DOWNLOAD EVIDENCE</a>
+                        </div>`;
+                        row.innerHTML = `<div class="detail-key">${key}</div><div class="detail-val" style="flex:1;">${displayValue}</div>`;
+                    } else {
+                        const displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : value;
+                        row.innerHTML = `<div class="detail-key">${key}</div><div class="detail-val">${displayValue}</div>`;
+                    }
+
                     modalBody.appendChild(row);
                 }
 
@@ -641,9 +725,15 @@ function Start-DataSensorHUD {
                     const newDiag = json.events.filter(e => e.Level !== "ALERT");
 
                     const newTotal = json.events.length;
+                    const latestTimestamp = json.events.length > 0 ? json.events[0].Timestamp : "";
 
-                    if (newTotal !== totalCount) {
-                        coreData = newCore; uebaData = newUeba; diagData = newDiag; totalCount = newTotal;
+                    if (newTotal !== totalCount || latestTimestamp !== window.lastRenderedTime) {
+                        coreData = newCore;
+                        uebaData = newUeba;
+                        diagData = newDiag;
+                        totalCount = newTotal;
+                        window.lastRenderedTime = latestTimestamp;
+
                         document.getElementById('count-core').innerText = coreData.length;
                         document.getElementById('count-ueba').innerText = uebaData.length;
                         document.getElementById('count-diag').innerText = diagData.length;
@@ -752,6 +842,20 @@ function Start-DataSensorHUD {
                     $Res.ContentLength64 = $Buffer.Length
                     $Res.OutputStream.Write($Buffer, 0, $Buffer.Length)
                 }
+                elseif ($ReqPath -match "^/api/download/(.+)$") {
+                    $fileName = $matches[1] -replace "[^a-zA-Z0-9_\-\.]", ""
+                    $targetFile = Join-Path "C:\ProgramData\DataSensor\Evidence" $fileName
+
+                    if (Test-Path $targetFile) {
+                        $Buffer = [System.IO.File]::ReadAllBytes($targetFile)
+                        $Res.ContentType = "application/octet-stream"
+                        $Res.Headers.Add("Content-Disposition", "attachment; filename=$fileName")
+                        $Res.ContentLength64 = $Buffer.Length
+                        $Res.OutputStream.Write($Buffer, 0, $Buffer.Length)
+                    } else {
+                        $Res.StatusCode = 404
+                    }
+                }
                 else { $Res.StatusCode = 404 }
                 $Res.Close()
             } catch { break }
@@ -784,6 +888,7 @@ try {
         $BatchCount = 0
 
         while ([RealTimeDataSensor]::EventQueue.TryDequeue([ref]$evtRef)) {
+            [System.Threading.Interlocked]::Decrement([ref][RealTimeDataSensor]::_eventQueueCount) | Out-Null
             $evt = $evtRef
             $BatchCount++
             $global:TotalAlerts++
@@ -835,7 +940,7 @@ try {
                         $Identity = $global:IdentityCache[$evt.ProcessName]
                     } else {
                         try {
-                            $wmiProc = Get-WmiObject Win32_Process -Filter "Name = '$($evt.ProcessName).exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
+                            $wmiProc = Get-CimInstance Win32_Process -Filter "Name = '$($evt.ProcessName).exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
                             if ($wmiProc) { $Identity = $wmiProc.GetOwner().User; $global:IdentityCache[$evt.ProcessName] = $Identity }
                         } catch {}
                     }
@@ -870,23 +975,14 @@ try {
                     $ActionUser = if ($alert.user -and $alert.user -ne "System") { $alert.user } elseif ($evt.UserName) { $evt.UserName } else { $Identity }
 
                     $LogMsg = "Conviction: $($alert.alert_type) | User: $ActionUser | Confidence: $($alert.confidence) | $($alert.details)"
-                    Write-Diag -Message $LogMsg -Level "ALERT" -Tactic $mitre -ProcessName $evt.ProcessName
+
+                    $ExtraCtx = @{}
+                    if ($alert.filepath) { $ExtraCtx["FilePath"] = $alert.filepath }
+                    if ($alert.file_hash) { $ExtraCtx["FileHash"] = $alert.file_hash }
+
+                    Write-Diag -Message $LogMsg -Level "ALERT" -Tactic $mitre -ProcessName $evt.ProcessName -Context $ExtraCtx
 
                     $outMsg = "[$ts] $mitre | $($alert.alert_type) | [$contextIndicator] $ActionUser@$($evt.ProcessName) | $($alert.details)"
-
-                    <#
-                    .ARCHITECTURAL_ANCHOR 5: SIEM & DATA LAKE FORWARDING
-                        [FUTURE INTEGRATION ZONE]
-                        Ship the schematized JSON object to a centralized aggregation tier.
-                        Implementation must use a Fire-and-Forget asynchronous HTTPS/gRPC push.
-                    #>
-
-                    <#
-                    .ARCHITECTURAL_ANCHOR 12: OFFLINE TELEMETRY SPOOLING
-                        [FUTURE INTEGRATION ZONE]
-                        If the SIEM/XDR endpoint is unreachable (e.g., laptop disconnected),
-                        divert the JSON payload into an encrypted local SQLite Spool DB.
-                    #>
 
                     $SiemObject = @{ timestamp = $ts; host = $env:COMPUTERNAME; user = $Identity; process = $evt.ProcessName; alert = $alert } | ConvertTo-Json -Compress
                     $SpoolFile = "C:\ProgramData\DataSensor\Data\OfflineSpool.jsonl"
@@ -925,11 +1021,22 @@ try {
             $global:LastHeartbeat = [DateTime]::UtcNow
             $MemUsageMB = [math]::Round((Get-Process -Id $PID).WorkingSet64 / 1MB, 2)
 
-            $EtwState = if ($QueueSize -ge 90000) { "Degraded" } else { "Good" }
+            if (-not $global:LastGroom -or ([DateTime]::UtcNow - $global:LastGroom).TotalHours -ge 6) {
+                $global:LastGroom = [DateTime]::UtcNow
+                try {
+                    $GroomedRows = [RealTimeDataSensor]::TriggerGrooming(30)
+                    if ($GroomedRows -ge 0) {
+                        Write-Diag -Message "Database grooming complete. Purged $GroomedRows stale benign rows (>30d retention)." -Level "INFO"
+                    }
+                } catch {
+                    Write-Diag -Message "Database grooming error: $_" -Level "WARN"
+                }
+            }
+
             $QueueSize = [RealTimeDataSensor]::EventQueue.Count
+            $EtwState  = if ($QueueSize -ge 90000) { "Degraded" } else { "Good" }
 
             Draw-Dashboard -Events $global:TotalEvents -Alerts $global:TotalAlerts -EtwHealth $EtwState -QueueSize $QueueSize
-
             Draw-AlertWindow
             <#
             .ARCHITECTURAL_ANCHOR 3: AGGREGATED TELEMETRY HEARTBEAT
@@ -949,7 +1056,6 @@ try {
                 [FUTURE INTEGRATION ZONE]
             #>
 
-            $EtwState = "Good"
             if ($QueueSize -ge 90000) {
                 Write-Diag -Message "UEBA Queue Saturation (90k+). Engine lagging behind ETW firehose." -Level "WARN"
                 $EtwState = "Degraded"
@@ -973,7 +1079,7 @@ try {
         }
 
         if ($global:UiNeedsUpdate -or ($BatchCount -gt 0)) {
-            Draw-Dashboard -Events $global:TotalEvents -Alerts $global:TotalAlerts -QueueSize $global:DataQueueSize
+            Draw-Dashboard -Events $global:TotalEvents -Alerts $global:TotalAlerts -EtwHealth $EtwState -QueueSize $QueueSize
             Draw-AlertWindow
             $global:UiNeedsUpdate = $false
         }
@@ -987,10 +1093,37 @@ try {
     Write-Host "`n$cGold[*] Initiating Graceful Shutdown...$cReset"
     Write-Diag "Initiating Teardown Sequence..." "INFO"
 
-    <#
-    .ARCHITECTURAL_ANCHOR 10: GRACEFUL UI & HUD TEARDOWN
-        [FUTURE INTEGRATION ZONE]
-    #>
+    Write-Host "    [*] Signaling Ring-3 Hooks to safely detach..." -ForegroundColor Gray
+    $null | Out-File -FilePath "C:\ProgramData\DataSensor\Teardown.sig" -Force
+    Start-Sleep -Seconds 2
+    $TeardownCode = @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class HookTeardown {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenEvent(uint dwDesiredAccess, bool bInheritHandle, string lpName);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool SetEvent(IntPtr hEvent);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        public static void Broadcast() {
+            // Open the global event to signal all injected processes
+            IntPtr hEvent = OpenEvent(0x0002, false, "Global\\DataSensor_Teardown_Event");
+            if (hEvent == IntPtr.Zero) {
+                hEvent = CreateEvent(IntPtr.Zero, true, false, "Global\\DataSensor_Teardown_Event");
+            }
+            if (hEvent != IntPtr.Zero) {
+                SetEvent(hEvent);
+                CloseHandle(hEvent);
+            }
+        }
+    }
+"@
+    Add-Type -TypeDefinition $TeardownCode -ErrorAction SilentlyContinue
+    [HookTeardown]::Broadcast()
 
     Write-Host "    [*] Terminating Web HUD Runspace & releasing port bindings..." -ForegroundColor Gray
     try {
@@ -1000,7 +1133,6 @@ try {
         }
     } catch {}
 
-    Write-Host "    [*] Terminating Web HUD Runspace... (Will do later)" -ForegroundColor Gray
 
     Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
     try { [RealTimeDataSensor]::StopSession() } catch {}

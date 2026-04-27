@@ -6,8 +6,8 @@
     Compiles the native Rust Machine Learning engine into a C-Compatible Dynamic
     Link Library (DataSensor_ML.dll). Acquires TraceEvent dependencies via NuGet
     and executes cryptographic hashing for verification.
-.AUTHOR
-    Robert Weber
+
+@RW
 #>
 #Requires -RunAsAdministrator
 
@@ -16,7 +16,6 @@ $WorkingDir = $PWD.Path
 $ProjectDir = $WorkingDir
 $BinDir = Join-Path $WorkingDir "Bin"
 $DepDir = "C:\ProgramData\DataSensor\Dependencies"
-$FinalBinaryName = "DataSensor_ML.dll"
 
 $ESC = [char]27
 $cRed = "$ESC[91m"; $cCyan = "$ESC[96m"; $cGreen = "$ESC[92m"; $cYellow = "$ESC[93m"; $cReset = "$ESC[0m"
@@ -51,7 +50,7 @@ $TraceEventDll = Join-Path $DepDir "Microsoft.Diagnostics.Tracing.TraceEvent.dll
 
 if (-not (Test-Path $TraceEventDll)) {
     Write-Host "    [*] Acquiring TraceEvent package from NuGet..." -ForegroundColor Yellow
-    $NugetUrl = "https://www.nuget.org/api/v2/package/Microsoft.Diagnostics.Tracing.TraceEvent/3.0.2"
+    $NugetUrl = "https://www.nuget.org/api/v2/package/Microsoft.Diagnostics.Tracing.TraceEvent/3.2.2"
     $ZipPath = Join-Path $DepDir "traceevent.zip"
     $ExtractPath = Join-Path $DepDir "extracted"
 
@@ -69,52 +68,68 @@ if (-not (Test-Path $TraceEventDll)) {
 }
 
 # ============================================================================
-# 3. RUST COMPILATION PIPELINE
+# 3. RUST COMPILATION PIPELINE (WORKSPACE)
 # ============================================================================
 if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
 
-Write-Host "`n    [*] Prepping Cargo build environment..." -ForegroundColor Gray
+Write-Host "`n    [*] Prepping Cargo build environment for Workspace..." -ForegroundColor Gray
+
+Write-Host "    [*] Purging Cargo Cache and stale locks..." -ForegroundColor Yellow
+& cmd.exe /c "cd /d `"$ProjectDir`" && cargo clean"
+
 $CompileWrapper = Join-Path $WorkingDir "compile_native.cmd"
 $WrapperLogic = @"
 @echo off
 cd /d "$ProjectDir"
 set RUSTFLAGS=-C target-feature=+crt-static
-cargo build --release
+cargo build --release --workspace
 exit /b %ERRORLEVEL%
 "@
 Set-Content -Path $CompileWrapper -Value $WrapperLogic
 
-Write-Host "    [*] Executing Cargo Release Build (LTO Enabled)..." -ForegroundColor Yellow
-& cmd.exe /c $CompileWrapper
+try {
+    Write-Host "    [*] Executing Cargo Release Build (ML & Hook Engines)..." -ForegroundColor Yellow
+    & cmd.exe /c $CompileWrapper
 
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "`n$cRed[!] COMPILATION FAILED: Cargo returned exit code $LASTEXITCODE$cReset"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`n$cRed[!] COMPILATION FAILED: Cargo returned exit code $LASTEXITCODE$cReset"
+        Exit
+    }
+
+    # ============================================================================
+    # 4. EXTRACTION, STAGING & CLEANUP
+    # ============================================================================
+    $CompiledMlDll   = Join-Path $ProjectDir "target\release\data_sensor_ml.dll"
+    $CompiledHookDll = Join-Path $ProjectDir "target\release\data_sensor_hook.dll"
+    $FinalMlDest     = Join-Path $ProjectDir "DataSensor_ML.dll"
+    $FinalHookDest   = Join-Path $ProjectDir "DataSensor_Hook.dll"
+
+    if ((Test-Path $CompiledMlDll) -and (Test-Path $CompiledHookDll)) {
+
+        Copy-Item -Path $CompiledMlDll   -Destination $FinalMlDest   -Force
+        Copy-Item -Path $CompiledHookDll -Destination $FinalHookDest -Force
+
+        Write-Host "`n$cGreen[+] SUCCESS: Native Data Sensor Engines Compiled Successfully.$cReset"
+
+        $MlHash   = (Get-FileHash -Path $FinalMlDest   -Algorithm SHA256).Hash
+        $HookHash = (Get-FileHash -Path $FinalHookDest -Algorithm SHA256).Hash
+
+        Write-Host "    -> DataSensor_ML.dll   | SHA256: $MlHash"   -ForegroundColor DarkGray
+        Write-Host "    -> DataSensor_Hook.dll | SHA256: $HookHash`n" -ForegroundColor DarkGray
+
+        $ManifestPath = Join-Path $ProjectDir "checksums.sha256"
+@"
+$MlHash  DataSensor_ML.dll
+$HookHash  DataSensor_Hook.dll
+"@ | Set-Content -Path $ManifestPath -Encoding ASCII -Force
+        Write-Host "    -> Hash manifest written to: $ManifestPath" -ForegroundColor DarkGray
+
+        Write-Host "    [*] Cleaning up temporary compilation directories..." -ForegroundColor Yellow
+        Remove-Item -Path (Join-Path $ProjectDir "target") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path (Join-Path $ProjectDir "Bin") -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "`n$cRed[!] ERROR: Expected output DLLs not found in target/release directory.$cReset"
+    }
+} finally {
     Remove-Item $CompileWrapper -Force -ErrorAction SilentlyContinue
-    Exit
-}
-
-# ============================================================================
-# 4. EXTRACTION, HASHING & CLEANUP
-# ============================================================================
-$CompiledDll = Join-Path $ProjectDir "target\release\data_sensor_ml.dll"
-$FinalDest = Join-Path $BinDir $FinalBinaryName
-
-if (Test-Path $CompiledDll) {
-    Copy-Item -Path $CompiledDll -Destination $FinalDest -Force
-
-    $HashVal = (Get-FileHash $FinalDest -Algorithm SHA256).Hash
-    $HashDest = Join-Path $BinDir ($FinalBinaryName -replace "\.dll$", ".sha256")
-    $HashVal | Out-File -FilePath $HashDest -Encoding ascii -NoNewline
-
-    Remove-Item $CompileWrapper -Force -ErrorAction SilentlyContinue
-
-    $SizeMB = [math]::Round(((Get-Item $FinalDest).Length / 1MB), 2)
-    Write-Host "`n$cCyan╔══════════════════════════════════════════════════════════════════════════╗$cReset"
-    Write-Host "$cCyan║$cReset $cGreen SUCCESS: Native Data Sensor Engine Compiled Successfully"
-    Write-Host "$cCyan║$cReset  Target : $FinalBinaryName"
-    Write-Host "$cCyan║$cReset  Size   : $($SizeMB) MB"
-    Write-Host "$cCyan║$cReset  SHA256 : $HashVal"
-    Write-Host "$cCyan╚══════════════════════════════════════════════════════════════════════════╝$cReset`n"
-} else {
-    Write-Host "`n$cRed[!] ERROR: Expected output DLL not found in target/release directory.$cReset"
 }
