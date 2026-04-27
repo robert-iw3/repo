@@ -3,6 +3,7 @@
  * COMPONENT:       lib.rs (In-Band API Hook)
  * DESCRIPTION:     Hooks WriteFile, computes SHA256 hashes for validation, inspects buffers,
  * and communicates with the C# Orchestrator via Named Pipes.
+ * Integrates safe file-sentinel teardown and re-entrancy protections.
  * @RW
  *============================================================================================*/
 
@@ -16,9 +17,8 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use lazy_static::lazy_static;
 
-thread_local! {
-    static IN_HOOK: std::cell::Cell<bool> = std::cell::Cell::new(false);
-}
+#[path = "hook_teardown.rs"]
+mod teardown;
 
 type WriteFileFn = unsafe extern "system" fn(
     *mut c_void,   // HANDLE hFile
@@ -38,6 +38,20 @@ struct IoStatusBlock {
     information: usize,
 }
 
+type NtWriteFileFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *mut IoStatusBlock,
+    *const std::ffi::c_void,
+    u32,
+    *mut i64,
+    *mut u32,
+) -> i32;
+
+static ORIGINAL_NTWRITEFILE: std::sync::OnceLock<NtWriteFileFn> = std::sync::OnceLock::new();
+
 #[repr(C)]
 struct FileNameInfo {
     file_name_length: u32,
@@ -56,6 +70,8 @@ const FILE_NAME_INFORMATION_CLASS: u32 = 9;
 
 static NT_QUERY_INFO_FILE: OnceLock<NtQueryInfoFileFn> = OnceLock::new();
 
+static HINST_DLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Serialize)]
 struct DlpAlert {
     alert_type: String,
@@ -64,6 +80,42 @@ struct DlpAlert {
     file_hash: String,
     confidence: i32,
     mitre_tactic: String,
+}
+
+static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn ensure_initialized(hinst_dll: *mut c_void) {
+    INIT.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        teardown::on_attach(hinst_dll as usize);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
+        let _ = ALERT_SENDER.set(tx);
+
+        let rx_ptr = Box::into_raw(Box::new(rx));
+        unsafe {
+            CreateThread(std::ptr::null_mut(), 0, Some(ipc_worker), rx_ptr as *mut _, 0, std::ptr::null_mut());
+        }
+    });
+}
+
+unsafe extern "system" fn ipc_worker(param: *mut std::ffi::c_void) -> u32 {
+    let rx = Box::from_raw(param as *mut std::sync::mpsc::Receiver<String>);
+    while !teardown::is_teardown_requested() {
+        if let Ok(payload) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            let mut retries = 0;
+            while retries < 15 && !teardown::is_teardown_requested() {
+                if let Ok(mut pipe) = OpenOptions::new().write(true).open(r"\\.\pipe\DataSensorAlerts") {
+                    use std::io::Write;
+                    let _ = pipe.write_all(payload.as_bytes());
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                retries += 1;
+            }
+        }
+    }
+    0
 }
 
 lazy_static! {
@@ -101,7 +153,17 @@ lazy_static! {
                             if parts.len() == 2 {
                                 let val = parts[1].trim();
                                 if !val.is_empty() {
-                                    regex_list.push(val.to_string());
+                                    match regex::Regex::new(val) {
+                                        Ok(re) if !(re.is_match("") && re.is_match("a") && re.is_match("0")) => {
+                                            regex_list.push(val.to_string());
+                                        }
+                                        Ok(_) => {
+                                            // Silently discard universal-match patterns — they match everything.
+                                        }
+                                        Err(_) => {
+                                            // Invalid regex — discard silently.
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -115,9 +177,15 @@ lazy_static! {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetFileType(hFile: *mut c_void) -> u32;
-    fn CreateEventA(lpEventAttributes: *mut c_void, bManualReset: i32, bInitialState: i32, lpName: *const u8) -> *mut c_void;
-    fn WaitForSingleObject(hHandle: *mut c_void, dwMilliseconds: u32) -> u32;
-    fn CloseHandle(hObject: *mut c_void) -> i32;
+
+    fn CreateThread(
+        lpThreadAttributes: *mut std::ffi::c_void,
+        dwStackSize: usize,
+        lpStartAddress: Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> u32>,
+        lpParameter: *mut std::ffi::c_void,
+        dwCreationFlags: u32,
+        lpThreadId: *mut u32,
+    ) -> *mut std::ffi::c_void;
 }
 const FILE_TYPE_DISK: u32 = 0x0001;
 
@@ -128,209 +196,25 @@ unsafe extern "system" fn hooked_write_file(
     lp_bytes_written: *mut u32,
     lp_overlapped: *mut c_void,
 ) -> i32 {
+    ensure_initialized(HINST_DLL.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void);
+
     if GetFileType(h_file) != FILE_TYPE_DISK {
         return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
     }
-
-    if n_bytes == 0 || lp_buffer.is_null() || IN_HOOK.with(|f| f.get()) {
-        return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-    }
-    IN_HOOK.with(|f| f.set(true));
-
-    let mut original_name = "intercepted_payload.dat".to_string();
-
-    let file_path_opt: Option<String> = if let Some(nt_fn) = NT_QUERY_INFO_FILE.get() {
-        let mut isb = IoStatusBlock { status: 0, information: 0 };
-        let mut name_info = FileNameInfo { file_name_length: 0, file_name: [0u16; 512] };
-        let status = nt_fn(h_file as isize, &mut isb, &mut name_info as *mut _ as *mut c_void, std::mem::size_of::<FileNameInfo>() as u32, FILE_NAME_INFORMATION_CLASS);
-
-        if status == 0 || status == 0x80000005u32 as i32 {
-            let len = (name_info.file_name_length / 2) as usize;
-            let path_str = String::from_utf16_lossy(&name_info.file_name[..len.min(512)]);
-
-            if let Some(idx) = path_str.rfind('\\') {
-                original_name = path_str[idx + 1..].to_string();
-            } else if let Some(idx) = path_str.rfind('/') {
-                original_name = path_str[idx + 1..].to_string();
-            } else {
-                original_name = path_str.clone();
-            }
-            Some(path_str.to_lowercase())
-        } else { None }
-    } else { None };
-
-    if let Some(ref file_path) = file_path_opt {
-        let is_own_path = file_path.contains("datasensor")
-            || file_path.contains("namedpipe")
-            || file_path.ends_with(".jsonl")
-            || file_path.ends_with(".log")
-            || file_path.contains("afd")
-            || file_path.contains("tcp")
-            || file_path.contains("udp")
-            || file_path.contains("endpoint")
-            || file_path.contains("mup");
-
-        if is_own_path {
-            IN_HOOK.with(|f| f.set(false));
-            return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-        }
-
-        if file_path.ends_with(".zip") {
-            let alert = DlpAlert {
-                alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
-                details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
-                filepath: file_path.clone(),
-                file_hash: String::new(),
-                confidence: 50,
-                mitre_tactic: "T1560 - Archive Collected Data".to_string(),
-            };
-            if let Ok(json_payload) = serde_json::to_string(&alert) {
-                if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
-            }
-            IN_HOOK.with(|f| f.set(false));
-            return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-        }
-    }
-
-    const MIN_INSPECT_BYTES: u32 = 512;
-    if n_bytes < MIN_INSPECT_BYTES {
-        IN_HOOK.with(|f| f.set(false));
+    if n_bytes == 0 || lp_buffer.is_null() {
         return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
     }
 
-    // 2. CORE BUFFER INSPECTION
-    let buffer_slice = std::slice::from_raw_parts(lp_buffer as *const u8, n_bytes as usize);
-
-    let json_keys: &[&[u8]] = &[b"alert_type", b"DurationMs", b"Orchestrator", b"events"];
-    let mut is_json_telemetry = false;
-
-    for &key in json_keys {
-        if buffer_slice.windows(key.len()).any(|w| w == key) {
-            is_json_telemetry = true; break;
-        }
-        let mut utf16_key = Vec::with_capacity(key.len() * 2);
-        for &b in key { utf16_key.push(b); utf16_key.push(0); }
-
-        if buffer_slice.windows(utf16_key.len()).any(|w| w == utf16_key.as_slice()) {
-            is_json_telemetry = true; break;
-        }
-    }
-
-    let is_gzip = buffer_slice.len() > 2 && buffer_slice[0] == 0x1F && buffer_slice[1] == 0x8B;
-    if is_gzip || buffer_slice.starts_with(b"H4sI") || is_json_telemetry {
-        IN_HOOK.with(|f| f.set(false));
-        return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-    }
-
-    if buffer_slice.len() >= 4 && buffer_slice[0] == 0x50 && buffer_slice[1] == 0x4B && buffer_slice[2] == 0x03 && buffer_slice[3] == 0x04 {
-        let alert = DlpAlert {
-            alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
-            details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
-            filepath: "Encrypted/Compressed Archive".to_string(),
-            file_hash: String::new(),
-            confidence: 50,
-            mitre_tactic: "T1560 - Archive Collected Data".to_string(),
-        };
-        if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
-        }
-        IN_HOOK.with(|f| f.set(false));
-        return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-    }
-
-    let content_utf8 = String::from_utf8_lossy(buffer_slice);
-
-    let content_utf16: Option<String> = if buffer_slice.len() >= 4 && buffer_slice.len() % 2 == 0 {
-        let has_bom = buffer_slice[0] == 0xFF && buffer_slice[1] == 0xFE;
-        let null_odd_bytes = buffer_slice.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
-        let threshold = buffer_slice.len() / 4;
-        if has_bom || null_odd_bytes > threshold {
-            let start = if has_bom { 2 } else { 0 };
-            let words: Vec<u16> = buffer_slice[start..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            Some(String::from_utf16_lossy(&words).to_string())
-        } else {
-            None
-        }
-    } else {
-        None
+    let _guard = match teardown::HookGuard::acquire() {
+        Some(g) => g,
+        None => return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped),
     };
 
-    let is_orchestrator_utf8 = content_utf8.contains("\"alert_type\"")
-        || content_utf8.contains("\"events\":[")
-        || content_utf8.contains("\"Component\":\"Orchestrator\"")
-        || content_utf8.contains("\"DurationMs\":");
-
-    let is_orchestrator_utf16 = content_utf16.as_ref().map_or(false, |s|
-        s.contains("\"alert_type\"")
-        || s.contains("\"events\":[")
-        || s.contains("\"Component\":\"Orchestrator\"")
-        || s.contains("\"DurationMs\":")
-    );
-
-    if is_orchestrator_utf8 || is_orchestrator_utf16 {
-        IN_HOOK.with(|f| f.set(false));
-        return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
-    }
-
-    let mut matched = false;
-    let mut trigger_detail = String::new();
-
-    for kw in DLP_LITERALS.iter() {
-        let utf8_hit = content_utf8.contains(kw.as_str());
-        let utf16_hit = content_utf16.as_ref().map_or(false, |s| s.contains(kw.as_str()));
-        if utf8_hit || utf16_hit {
-            matched = true;
-            trigger_detail = format!("Literal Match: {}", kw);
-            break;
-        }
-    }
-
-    if !matched {
-        let utf8_hit = DLP_PATTERNS.is_match(&content_utf8);
-        let utf16_hit = content_utf16.as_ref().map_or(false, |s| DLP_PATTERNS.is_match(s));
-        if utf8_hit || utf16_hit {
-            matched = true;
-            trigger_detail = "Regex Signature Match".to_string();
-        }
-    }
-
-    if matched {
-        let mut hasher = Sha256::new();
-        hasher.update(buffer_slice);
-        let computed_hash = hex::encode(hasher.finalize());
-
-        let evidence_dir = Path::new(r"C:\ProgramData\DataSensor\Evidence");
-        let _ = fs::create_dir_all(evidence_dir);
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let evidence_path = evidence_dir.join(
-            format!("{}_{}_{}", timestamp, &computed_hash[0..8], original_name)
-        );
-
-        if let Ok(mut file) = File::create(&evidence_path) {
-            let _ = file.write_all(buffer_slice);
-        }
-
-        let alert = DlpAlert {
-            alert_type: "ACTION_REQUIRED".to_string(),
-            details: format!("In-Band Write Blocked | {}", trigger_detail),
-            filepath: evidence_path.display().to_string(),
-            file_hash: computed_hash,
-            confidence: 100,
-            mitre_tactic: "T1485 - Data Destruction / Mitigation".to_string(),
-        };
-        if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
-        }
-
+    if !inspect_and_alert(h_file, lp_buffer, n_bytes) {
         if !lp_bytes_written.is_null() { *lp_bytes_written = 0; }
-        IN_HOOK.with(|f| f.set(false));
         return 0;
     }
 
-    IN_HOOK.with(|f| f.set(false));
     resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped)
 }
 
@@ -351,24 +235,226 @@ unsafe fn resume_original(
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
 
+pub fn remove_hooks() {
+    unsafe {
+        let _ = minhook_sys::MH_DisableHook(std::ptr::null_mut()); // Restore original bytes
+        let _ = minhook_sys::MH_Uninitialize();                     // Free trampoline heap
+    }
+}
+
+unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_bytes: u32) -> bool {
+    if n_bytes == 0 || lp_buffer.is_null() { return true; }
+
+    let mut original_name = "intercepted_payload.dat".to_string();
+
+    let file_path_opt: Option<String> = if let Some(nt_fn) = NT_QUERY_INFO_FILE.get() {
+        let mut isb = IoStatusBlock { status: 0, information: 0 };
+        let mut name_info = FileNameInfo { file_name_length: 0, file_name: [0u16; 512] };
+        let status = nt_fn(h_file as isize, &mut isb,
+            &mut name_info as *mut _ as *mut c_void,
+            std::mem::size_of::<FileNameInfo>() as u32,
+            FILE_NAME_INFORMATION_CLASS);
+
+        if status == 0 || status == 0x80000005u32 as i32 {
+            let len = (name_info.file_name_length / 2) as usize;
+            let path_str = String::from_utf16_lossy(&name_info.file_name[..len.min(512)]);
+            if let Some(idx) = path_str.rfind('\\') {
+                original_name = path_str[idx + 1..].to_string();
+            } else if let Some(idx) = path_str.rfind('/') {
+                original_name = path_str[idx + 1..].to_string();
+            } else {
+                original_name = path_str.clone();
+            }
+            Some(path_str.to_lowercase())
+        } else { None }
+    } else { None };
+
+    let file_path = match file_path_opt {
+        Some(p) => p,
+        None => return true, // Can't resolve path — allow
+    };
+
+    let is_own_path = file_path.contains("datasensor")
+        || file_path.contains("namedpipe")
+        || file_path.ends_with(".jsonl")
+        || file_path.ends_with(".log")
+        || file_path.contains("afd")
+        || file_path.contains("tcp")
+        || file_path.contains("udp")
+        || file_path.contains("endpoint")
+        || file_path.contains("mup");
+
+    let is_system_noise = file_path.ends_with(".cache")
+        || file_path.ends_with(".journal")
+        || file_path.ends_with(".sqlite")
+        || file_path.ends_with(".db")
+        || file_path.ends_with(".db-wal")
+        || file_path.ends_with(".db-shm")
+        || file_path.ends_with(".etl")
+        || file_path.ends_with(".tmp")
+        || file_path.ends_with(".db-journal")
+        || file_path.ends_with(".crdownload")
+        || file_path.ends_with(".partial")
+        || file_path.contains("chrome\\user data");
+
+    if is_own_path || is_system_noise { return true; }
+
+    if file_path.ends_with(".zip") {
+        let alert = DlpAlert {
+            alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
+            details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
+            filepath: file_path.clone(),
+            file_hash: String::new(),
+            confidence: 50,
+            mitre_tactic: "T1560 - Archive Collected Data".to_string(),
+        };
+        if let Ok(json_payload) = serde_json::to_string(&alert) {
+            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+        }
+        return true; // Allow — orchestrator handles it
+    }
+
+    const MIN_INSPECT_BYTES: u32 = 16;
+    if n_bytes < MIN_INSPECT_BYTES { return true; }
+
+    let buffer_slice = std::slice::from_raw_parts(lp_buffer as *const u8, n_bytes as usize);
+
+    let json_keys: &[&[u8]] = &[b"alert_type", b"DurationMs", b"Orchestrator", b"events"];
+    let mut is_json_telemetry = false;
+    for &key in json_keys {
+        if buffer_slice.windows(key.len()).any(|w| w == key) { is_json_telemetry = true; break; }
+        let mut utf16_key = Vec::with_capacity(key.len() * 2);
+        for &b in key { utf16_key.push(b); utf16_key.push(0); }
+        if buffer_slice.windows(utf16_key.len()).any(|w| w == utf16_key.as_slice()) {
+            is_json_telemetry = true; break;
+        }
+    }
+    let is_gzip = buffer_slice.len() > 2 && buffer_slice[0] == 0x1F && buffer_slice[1] == 0x8B;
+    if is_gzip || buffer_slice.starts_with(b"H4sI") || is_json_telemetry { return true; }
+
+    if buffer_slice.len() >= 4
+        && buffer_slice[0] == 0x50 && buffer_slice[1] == 0x4B
+        && buffer_slice[2] == 0x03 && buffer_slice[3] == 0x04 {
+        let alert = DlpAlert {
+            alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
+            details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
+            filepath: "Encrypted/Compressed Archive".to_string(),
+            file_hash: String::new(),
+            confidence: 50,
+            mitre_tactic: "T1560 - Archive Collected Data".to_string(),
+        };
+        if let Ok(json_payload) = serde_json::to_string(&alert) {
+            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+        }
+        return true;
+    }
+
+    let content_utf8 = String::from_utf8_lossy(buffer_slice);
+    let content_utf16: Option<String> = if buffer_slice.len() >= 4 && buffer_slice.len() % 2 == 0 {
+        let has_bom = buffer_slice[0] == 0xFF && buffer_slice[1] == 0xFE;
+        let null_odd = buffer_slice.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        if has_bom || null_odd > buffer_slice.len() / 4 {
+            let start = if has_bom { 2 } else { 0 };
+            let words: Vec<u16> = buffer_slice[start..]
+                .chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            Some(String::from_utf16_lossy(&words).to_string())
+        } else { None }
+    } else { None };
+
+    let is_orch = content_utf8.contains("\"alert_type\"")
+        || content_utf8.contains("\"events\":[")
+        || content_utf8.contains("\"Component\":\"Orchestrator\"")
+        || content_utf8.contains("\"DurationMs\":");
+    let is_orch_utf16 = content_utf16.as_ref().map_or(false, |s|
+        s.contains("\"alert_type\"") || s.contains("\"events\":[")
+        || s.contains("\"Component\":\"Orchestrator\"") || s.contains("\"DurationMs\":"));
+    if is_orch || is_orch_utf16 { return true; }
+
+    let mut matched = false;
+    let mut trigger_detail = String::new();
+
+    for kw in DLP_LITERALS.iter() {
+        let hit = content_utf8.contains(kw.as_str())
+            || content_utf16.as_ref().map_or(false, |s| s.contains(kw.as_str()));
+        if hit { matched = true; trigger_detail = format!("Literal Match: {}", kw); break; }
+    }
+    if !matched {
+        let hit = DLP_PATTERNS.is_match(&content_utf8)
+            || content_utf16.as_ref().map_or(false, |s| DLP_PATTERNS.is_match(s));
+        if hit { matched = true; trigger_detail = "Regex Signature Match".to_string(); }
+    }
+
+    if matched {
+        let mut hasher = Sha256::new();
+        hasher.update(buffer_slice);
+        let computed_hash = hex::encode(hasher.finalize());
+
+        let evidence_dir = Path::new(r"C:\ProgramData\DataSensor\Evidence");
+        let _ = fs::create_dir_all(evidence_dir);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let evidence_path = evidence_dir.join(
+            format!("{}_{}_{}", timestamp, &computed_hash[0..8], original_name));
+
+        if let Ok(mut file) = File::create(&evidence_path) {
+            let _ = file.write_all(buffer_slice);
+        }
+
+        let alert = DlpAlert {
+            alert_type: "ACTION_REQUIRED".to_string(),
+            details: format!("In-Band Write Blocked | {}", trigger_detail),
+            filepath: evidence_path.display().to_string(),
+            file_hash: computed_hash,
+            confidence: 100,
+            mitre_tactic: "T1485 - Data Destruction / Mitigation".to_string(),
+        };
+        if let Ok(json_payload) = serde_json::to_string(&alert) {
+            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+        }
+        return false; // Block the write
+    }
+
+    true // Allow
+}
+
+unsafe extern "system" fn hooked_ntwritefile(
+    h_file: *mut c_void, h_event: *mut c_void, apc_routine: *mut c_void, apc_context: *mut c_void,
+    io_status_block: *mut IoStatusBlock, buffer: *const c_void, length: u32, byte_offset: *mut i64, key: *mut u32,
+) -> i32 {
+    if GetFileType(h_file) != FILE_TYPE_DISK || length == 0 || buffer.is_null() {
+        if let Some(orig) = ORIGINAL_NTWRITEFILE.get() { return orig(h_file, h_event, apc_routine, apc_context, io_status_block, buffer, length, byte_offset, key); }
+        return 0xC0000001u32 as i32;
+    }
+
+    let _guard = match teardown::HookGuard::acquire() {
+        Some(g) => g,
+        None => {
+            if let Some(orig) = ORIGINAL_NTWRITEFILE.get() { return orig(h_file, h_event, apc_routine, apc_context, io_status_block, buffer, length, byte_offset, key); }
+            return 0xC0000001u32 as i32;
+        }
+    };
+
+    if !inspect_and_alert(h_file, buffer, length) {
+        if !io_status_block.is_null() { (*io_status_block).information = 0; }
+        return 0xC0000022u32 as i32;
+    }
+
+    if let Some(orig) = ORIGINAL_NTWRITEFILE.get() {
+        return orig(h_file, h_event, apc_routine, apc_context, io_status_block, buffer, length, byte_offset, key);
+    }
+    0xC0000001u32 as i32
+}
+
 #[no_mangle]
-pub extern "system" fn DllMain(_hinst_dll: *mut c_void, fdw_reason: u32, _lpv_reserved: *mut c_void) -> i32 {
+#[allow(non_snake_case)]
+pub extern "system" fn DllMain(hinst_dll: *mut c_void, fdw_reason: u32, _lpv_reserved: *mut c_void) -> i32 {
     match fdw_reason {
         DLL_PROCESS_ATTACH => {
             unsafe {
-                std::thread::spawn(move || {
-                    let shutdown_file = std::path::Path::new(r"C:\ProgramData\DataSensor\Teardown.sig");
-                    loop {
-                        if shutdown_file.exists() {
-                            unsafe {
-                                minhook_sys::MH_DisableHook(std::ptr::null_mut()); // Safely detach
-                                minhook_sys::MH_Uninitialize();
-                            }
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1000));
-                    }
-                });
+                windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls(hinst_dll as _);
+
+                HINST_DLL.store(hinst_dll as usize, std::sync::atomic::Ordering::Relaxed);
+
+                if minhook_sys::MH_Initialize() != 0 { return 1; }
 
                 let kernel32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
                     b"kernelbase.dll\0".as_ptr()
@@ -379,8 +465,6 @@ pub extern "system" fn DllMain(_hinst_dll: *mut c_void, fdw_reason: u32, _lpv_re
                     kernel32, b"WriteFile\0".as_ptr()
                 );
 
-                let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
-                let _ = ALERT_SENDER.set(tx);
                 let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
                     b"ntdll.dll\0".as_ptr()
                 );
@@ -390,29 +474,20 @@ pub extern "system" fn DllMain(_hinst_dll: *mut c_void, fdw_reason: u32, _lpv_re
                     ) {
                         let _ = NT_QUERY_INFO_FILE.set(std::mem::transmute(fn_addr));
                     }
-                }
 
-                std::thread::spawn(move || {
-                    IN_HOOK.with(|f| f.set(true));
-
-                    for payload in rx {
-                        let mut retries = 0;
-                        while retries < 15 {
-                            if let Ok(mut pipe) = OpenOptions::new().write(true).open(r"\\.\pipe\DataSensorAlerts") {
-                                let _ = pipe.write_all(payload.as_bytes());
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                            retries += 1;
+                    if let Some(nt_write_addr) = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                        ntdll, b"NtWriteFile\0".as_ptr()
+                    ) {
+                        let mut orig_nt: *mut c_void = std::ptr::null_mut();
+                        if minhook_sys::MH_CreateHook(nt_write_addr as *mut _, hooked_ntwritefile as *mut _, &mut orig_nt) == 0 {
+                            let _ = ORIGINAL_NTWRITEFILE.set(std::mem::transmute(orig_nt));
+                            let _ = minhook_sys::MH_EnableHook(nt_write_addr as *mut _);
                         }
                     }
-                });
+                }
 
                 if let Some(addr) = write_file_addr {
                     let addr_ptr = addr as *mut c_void;
-
-                    if minhook_sys::MH_Initialize() != 0 { return 1; }
-
                     let mut original: *mut c_void = std::ptr::null_mut();
                     if minhook_sys::MH_CreateHook(addr_ptr, hooked_write_file as *mut c_void, &mut original) == 0 {
                         let _ = ORIGINAL_WRITEFILE.set(std::mem::transmute(original));
@@ -422,10 +497,7 @@ pub extern "system" fn DllMain(_hinst_dll: *mut c_void, fdw_reason: u32, _lpv_re
             }
         }
         DLL_PROCESS_DETACH => {
-            unsafe {
-                let _ = minhook_sys::MH_DisableHook(std::ptr::null_mut()); // Disable all hooks
-                let _ = minhook_sys::MH_Uninitialize();
-            }
+            teardown::on_detach();
         }
         _ => {}
     }

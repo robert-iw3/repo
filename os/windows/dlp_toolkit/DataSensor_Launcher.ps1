@@ -46,13 +46,15 @@ function Write-Diag {
         Rename-Item -Path $global:LogFile -NewName $ArchiveName -Force
     }
 
+    $CleanMessage = $Message -replace "`r", "" -replace "`n", " "
+
     $LogObj = [ordered]@{
         Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         Level     = $Level
         Component = "Orchestrator"
         Process   = $ProcessName
         Tactic    = $Tactic
-        Message   = $Message
+        Message   = $CleanMessage
     }
 
     foreach ($key in $Context.Keys) { $LogObj[$key] = $Context[$key] }
@@ -225,6 +227,117 @@ function Draw-Dashboard([long]$Events, [int]$Alerts, [string]$EtwHealth, [int]$Q
     [Console]::SetCursorPosition($curLeft, $curTop)
 }
 
+function Invoke-BootSequence {
+    $ESC = [char]27
+    $cRed = "$ESC[38;2;255;49;49m"
+    $cWhite = "$ESC[38;2;255;255;255m"
+    $cDark = "$ESC[38;2;80;80;80m"
+    $cYellow = "$ESC[38;2;255;204;0m"
+    $cCyan = "$ESC[38;2;0;255;255m"
+    $cGreen = "$ESC[38;2;57;255;20m"
+    $cReset = "$ESC[0m$ESC[40m"
+
+    $Host.UI.RawUI.BackgroundColor = 'Black'
+    Clear-Host
+    [console]::cursorvisible = $false
+
+    function Type-Text([string]$text, [int]$delayMs = 30, [string]$color = $cWhite) {
+        Write-Host -NoNewline $color
+        $cursorBlock = "█"
+
+        foreach ($char in $text.ToCharArray()) {
+            Write-Host -NoNewline $char
+            Write-Host -NoNewline $cursorBlock
+            Start-Sleep -Milliseconds $delayMs
+            Write-Host -NoNewline "`b"
+        }
+        Write-Host -NoNewline " `b"
+        Write-Host $cReset
+    }
+
+    [Console]::SetCursorPosition(0, 1)
+    Type-Text "MEMORY CHECK... OK" 15 $cDark
+    Type-Text "LOADING HEURISTIC KERNEL... OK" 15 $cDark
+    Type-Text "POWERING OPTICAL SENSOR..." 15 $cDark
+    Start-Sleep -Milliseconds 500
+    Write-Host ""
+
+    $HalEye = @(
+        "             $cDark.----------.$cReset",
+        "           $cDark// $cRed.------.$cDark \\$cReset",
+        "          $cDark|| $cRed/ $cYellow.----.$cRed \$cDark ||$cReset",
+        "          $cDark|| $cRed| $cYellow/$cWhite..$cYellow\$cRed |$cDark ||$cReset",
+        "          $cDark|| $cRed| $cYellow\__/$cRed |$cDark ||$cReset",
+        "          $cDark|| $cRed\      /$cDark ||$cReset",
+        "           $cDark\\ $cRed`------'$cDark //$cReset",
+        "             $cDark`----------'$cReset"
+    )
+
+    foreach ($line in $HalEye) {
+        Write-Host "  $line"
+        Start-Sleep -Milliseconds 80
+    }
+
+    Write-Host ""
+
+    Type-Text "  [LOGIC TERMINAL : DISCOVERY ONE MAINFRAME]" 20 $cWhite
+    Type-Text "  [MODEL : HAL 9000]" 20 $cWhite
+    Type-Text "  [STATUS : INCAPABLE OF ERROR]" 20 $cCyan
+    Write-Host ""
+
+    Type-Text "  > CURRENT TIME: APRIL 20, 2030 - 03:33 UTC" 25 $cDark
+    Type-Text "  > LOCATION: PLANET EARTH" 25 $cDark
+    Write-Host ""
+
+    Type-Text "  > INITIALIZING SYSTEM LOGIC..." 40 $cWhite
+    Start-Sleep -Milliseconds 300
+    Write-Host "  > MOUNTING SQLITE LEDGER... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host "  > ALLOCATING 64KB SENTINEL THREAD... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host "  > DEPLOYING RING-3 HOOKS... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host "  > BYPASSING KERNEL SHIELDS... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host "  > ENGAGING UEBA BASELINE ENGINE... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host "  > LOADING DATA SENSOR... " -NoNewline -ForegroundColor DarkGray
+    Write-Host "[OK]" -ForegroundColor Green
+    Write-Host ""
+
+    Start-Sleep -Milliseconds 1000
+
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "SYSTEM ONLINE | START COOLDOWN" 80 $cRed
+
+    Start-Sleep -Seconds 2
+
+    Write-Host ""
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "Transfer this super secret data please, HAL." 60 $cWhite
+
+    Start-Sleep -Seconds 2
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "Hello, HAL. Do you read me?" 60 $cWhite
+
+    Start-Sleep -Seconds 1
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "Affirmative, Dave. I read you." 60 $cCyan
+
+    Start-Sleep -Seconds 1
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "Start the transfer now, HAL." 60 $cWhite
+
+    Start-Sleep -Seconds 1
+    Write-Host "  > " -NoNewline -ForegroundColor DarkGray
+    Type-Text "I'm sorry, Dave. I'm afraid I can't do that." 90 $cRed
+
+    Start-Sleep -Seconds 3
+
+    Clear-Host
+    [console]::cursorvisible = $true
+}
+
 # --- Configuration Parser ---
 $ConfigPath = Join-Path $ScriptDir "config.ini"
 if (-not (Test-Path $ConfigPath)) { Write-Host "[-] FATAL ERROR: config.ini not found." -ForegroundColor Red; exit }
@@ -349,6 +462,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         "System.Runtime",
         "System.Collections",
         "System.Collections.Concurrent",
+        "System.Collections.NonGeneric",
         "System.Threading",
         "System.Threading.Thread",
         "System.Diagnostics.Process",
@@ -500,6 +614,10 @@ Write-StartupLog "Bootstrapping Native FFI Data Sensor..."
 Write-Diag "Native Rust ML Engine (FFI) successfully mapped into memory." "INFO"
 [RealTimeDataSensor]::InjectExistingProcesses()
 [RealTimeDataSensor]::StartSession()
+
+if ($ConsoleUI -or -not $Background) {
+    Invoke-BootSequence
+}
 
 try { [console]::TreatControlCAsInput = $true } catch {}
 $Script:RunLoop = $true
@@ -827,8 +945,8 @@ function Start-DataSensorHUD {
                                 foreach ($line in $DiagLines) {
                                     if ($line -match "^\[(.*?)\] \[(.*?)\] (.*)") {
                                         $ts = $matches[1]; $lvl = $matches[2]; $msg = $matches[3]
-                                        $cleanMsg = $msg -replace '(["\\])', '\$1'
-                                        $jsonObj = "{ `"Timestamp`": `"$ts`", `"Level`": `"$lvl`", `"Component`": `"Engine`", `"Process`": `"System`", `"Tactic`": `"Diag`", `"Message`": `"$cleanMsg`" }"
+                                        $DiagObj = @{ Timestamp = $ts; Level = $lvl; Component = "Engine"; Process = "System"; Tactic = "Diag"; Message = $msg }
+                                        $jsonObj = $DiagObj | ConvertTo-Json -Compress
                                         $Events.Add($jsonObj)
                                     }
                                 }
@@ -843,13 +961,18 @@ function Start-DataSensorHUD {
                     $Res.OutputStream.Write($Buffer, 0, $Buffer.Length)
                 }
                 elseif ($ReqPath -match "^/api/download/(.+)$") {
-                    $fileName = $matches[1] -replace "[^a-zA-Z0-9_\-\.]", ""
+                    $fileName = [System.IO.Path]::GetFileName($matches[1])
+
+                    if ($fileName -match "^\.\." -or $fileName -match "[/\\]") {
+                        $Res.StatusCode = 403; $Res.Close(); continue
+                    }
+
                     $targetFile = Join-Path "C:\ProgramData\DataSensor\Evidence" $fileName
 
                     if (Test-Path $targetFile) {
                         $Buffer = [System.IO.File]::ReadAllBytes($targetFile)
                         $Res.ContentType = "application/octet-stream"
-                        $Res.Headers.Add("Content-Disposition", "attachment; filename=$fileName")
+                        $Res.Headers.Add("Content-Disposition", "attachment; filename=`"$fileName`"")
                         $Res.ContentLength64 = $Buffer.Length
                         $Res.OutputStream.Write($Buffer, 0, $Buffer.Length)
                     } else {
@@ -1025,7 +1148,9 @@ try {
                 $global:LastGroom = [DateTime]::UtcNow
                 try {
                     $GroomedRows = [RealTimeDataSensor]::TriggerGrooming(30)
-                    if ($GroomedRows -ge 0) {
+                    if ($GroomedRows -is [array]) { $GroomedRows = $GroomedRows[-1] }
+
+                    if ([int]$GroomedRows -ge 0) {
                         Write-Diag -Message "Database grooming complete. Purged $GroomedRows stale benign rows (>30d retention)." -Level "INFO"
                     }
                 } catch {
@@ -1093,39 +1218,70 @@ try {
     Write-Host "`n$cGold[*] Initiating Graceful Shutdown...$cReset"
     Write-Diag "Initiating Teardown Sequence..." "INFO"
 
-    Write-Host "    [*] Signaling Ring-3 Hooks to safely detach..." -ForegroundColor Gray
-    $null | Out-File -FilePath "C:\ProgramData\DataSensor\Teardown.sig" -Force
-    Start-Sleep -Seconds 2
-    $TeardownCode = @"
-    using System;
-    using System.Runtime.InteropServices;
-    public class HookTeardown {
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern IntPtr OpenEvent(uint dwDesiredAccess, bool bInheritHandle, string lpName);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern IntPtr CreateEvent(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool SetEvent(IntPtr hEvent);
-        [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool CloseHandle(IntPtr hObject);
+    $global:TeardownHandle = [System.IO.File]::Open($TeardownSig, 'Create', 'Write', 'Read')
 
-        public static void Broadcast() {
-            // Open the global event to signal all injected processes
-            IntPtr hEvent = OpenEvent(0x0002, false, "Global\\DataSensor_Teardown_Event");
-            if (hEvent == IntPtr.Zero) {
-                hEvent = CreateEvent(IntPtr.Zero, true, false, "Global\\DataSensor_Teardown_Event");
-            }
-            if (hEvent != IntPtr.Zero) {
-                SetEvent(hEvent);
-                CloseHandle(hEvent);
-            }
+    Write-Host "    [1/5] Writing File-Sentinel (Teardown.sig)..." -ForegroundColor Gray
+
+    try {
+        $null | Out-File -FilePath $TeardownSig -Force -ErrorAction Stop
+        Write-Diag "Teardown.sig written to $TeardownSig" "INFO"
+    } catch {
+        Write-Host "    [!] WARNING: Could not write Teardown.sig: $_" -ForegroundColor Yellow
+        Write-Diag "WARNING: Failed to write Teardown.sig: $_" "WARN"
+    }
+
+    Write-Host "    [2/5] Waiting for Ring-3 Hooks to self-eject..." -ForegroundColor Gray
+
+    $HookDllName   = "DataSensor_Hook.dll"
+    $MaxWaitMs     = 6000
+    $PollMs        = 300
+    $ElapsedMs     = 0
+    $EjectionClean = $false
+
+    while ($ElapsedMs -lt $MaxWaitMs) {
+        Start-Sleep -Milliseconds $PollMs
+        $ElapsedMs += $PollMs
+
+        $StillLoaded = @(
+            Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.Id -gt 4 } |
+            ForEach-Object {
+                try { $_.Modules | Where-Object { $_.ModuleName -ieq $HookDllName } }
+                catch { $null }
+            } |
+            Where-Object { $null -ne $_ }
+        )
+
+        if ($StillLoaded.Count -eq 0) {
+            $EjectionClean = $true
+            Write-Host "    [2/5] All hook instances ejected. ($ElapsedMs ms)" -ForegroundColor Green
+            Write-Diag "All DataSensor_Hook.dll instances confirmed ejected after $ElapsedMs ms." "INFO"
+            break
+        }
+
+        if ($ElapsedMs % 1000 -lt $PollMs) {
+            $StillIn = @($StillLoaded | ForEach-Object {
+                try { (Get-Process -Id $_.Handle -ErrorAction SilentlyContinue).ProcessName } catch { "pid?" }
+            }) -join ", "
+            Write-Host "    [2/5] Still active in: $StillIn — waiting..." -ForegroundColor DarkYellow
+        }
+
+        if (-not $EjectionClean) {
+            Write-Host "    [!] Hook ejection timeout after ${MaxWaitMs}ms. Forcing active Ring-3 ejection..." -ForegroundColor Yellow
+            Write-Diag "Hook teardown TIMEOUT. Initiating active C# closed-loop ejection." "WARN"
+
+            [RealTimeDataSensor]::ForceEjectHooks()
+
+            Start-Sleep -Milliseconds 1000
         }
     }
-"@
-    Add-Type -TypeDefinition $TeardownCode -ErrorAction SilentlyContinue
-    [HookTeardown]::Broadcast()
 
-    Write-Host "    [*] Terminating Web HUD Runspace & releasing port bindings..." -ForegroundColor Gray
+    if (-not $EjectionClean) {
+        Write-Host "    [!] Hook ejection timeout after ${MaxWaitMs}ms. Some processes may retain the hook." -ForegroundColor Yellow
+        Write-Diag "Hook teardown TIMEOUT after ${MaxWaitMs}ms. Proceeding with engine shutdown." "WARN"
+    }
+
+    Write-Host "    [3/5] Terminating Web HUD Runspace & releasing port bindings..." -ForegroundColor Gray
     try {
         if ($global:HudRunspace) {
             $global:HudRunspace.BeginStop($null, $null) | Out-Null
@@ -1133,17 +1289,20 @@ try {
         }
     } catch {}
 
+    Write-Host "    [4/5] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
+    try { [RealTimeDataSensor]::StopSession() } catch {
+        Write-Diag "StopSession error (non-fatal): $_" "WARN"
+    }
+    Write-Diag "C# TraceEvent Session halted and Rust FFI pointer freed." "INFO"
 
-    Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
-    try { [RealTimeDataSensor]::StopSession() } catch {}
-    Write-Diag "C# TraceEvent Session Halted and FFI Unmapped." "INFO"
-
-    Write-Host "    [*] Cleaning up centralized library artifacts..." -ForegroundColor Gray
+    Write-Host "    [5/5] Cleaning up staging artifacts..." -ForegroundColor Gray
     $StagingPath = "C:\ProgramData\DataSensor\Staging"
     if (Test-Path $StagingPath) {
         Remove-Item -Path "$StagingPath\*.zip" -Force -ErrorAction SilentlyContinue
     }
 
+    Remove-Item -Path $TeardownSig -Force -ErrorAction SilentlyContinue
+
     Write-Diag "=== DIAGNOSTIC LOG CLOSED ===" "INFO"
-    Write-Host "`n[+] Sensor Teardown Complete. Log artifacts preserved in C:\ProgramData\DataSensor\Logs & \Data." -ForegroundColor Green
+    Write-Host "`n$cGreen[+] Sensor Teardown Complete.$cReset Log artifacts preserved in C:\ProgramData\DataSensor\Logs & \Data." -ForegroundColor Green
 }

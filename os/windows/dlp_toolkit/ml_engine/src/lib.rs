@@ -130,7 +130,13 @@ pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpE
         }
     }
 
-    let regex_set = RegexSet::new(&config.regex_patterns).unwrap_or_else(|_| RegexSet::empty());
+    config.strict_strings.retain(|s| !s.trim().is_empty());
+    config.regex_patterns.retain(|s| !s.trim().is_empty());
+
+    let regex_set = RegexSet::new(&config.regex_patterns).unwrap_or_else(|e| {
+        eprintln!("[DataSensor ML] WARNING: Failed to compile RegexSet: {}", e);
+        RegexSet::empty()
+    });
     let patterns = config.regex_patterns.clone();
     let strict_set: std::collections::HashSet<String> = config.strict_strings.iter().cloned().collect();
 

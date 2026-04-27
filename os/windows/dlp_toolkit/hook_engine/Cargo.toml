@@ -16,6 +16,7 @@ sha2 = "0.10.8"
 hex = "0.4.3"
 lazy_static = "1.4.0"
 regex = "1.10.3"
+winapi = { version = "0.3", features = ["minwindef", "libloaderapi"] }
 windows-sys = { version = "0.52", features = [
     "Win32_System_LibraryLoader",
     "Win32_Foundation",
