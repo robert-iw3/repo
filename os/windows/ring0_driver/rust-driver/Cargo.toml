@@ -1,0 +1,44 @@
+[package]
+name    = "endpoint_monitor_driver"
+version = "0.7.0"
+edition = "2021"
+authors = ["Robert Weber"]
+license = "MIT"
+
+[package.metadata.wdk.driver-model]
+# KMDF base with selective WDM elements where the filter framework requires them.
+driver-type = "KMDF"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[build-dependencies]
+wdk-build = "0.5.1"
+
+[dependencies]
+wdk        = "0.5.1"
+wdk-sys    = "0.5.1"
+wdk-alloc  = "0.5.1"
+wdk-panic  = "0.5.1"
+wdk-macros = "0.5.1"
+fsfilter-rs = "0.4.0"
+
+[features]
+# Default feature set — includes ai_agent so the AGENT_EVENT signal path is
+# compiled in by default alongside the core monitoring features.
+default  = ["registry", "threads", "objects", "ai_agent", "network"]
+registry = []
+network  = []
+ai_agent = []
+threads  = []
+objects  = []
+memory   = []
+power    = []
+
+[profile.release]
+panic         = "abort"   # No unwinding in kernel mode
+opt-level     = 3
+lto           = true      # Whole-program optimisation for smallest/fastest image
+codegen-units = 1         # Single CGU required for effective LTO
+strip         = true      # Remove debug info from release binary
