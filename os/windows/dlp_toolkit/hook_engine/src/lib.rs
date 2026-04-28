@@ -72,6 +72,8 @@ static NT_QUERY_INFO_FILE: OnceLock<NtQueryInfoFileFn> = OnceLock::new();
 
 static HINST_DLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+static HOST_PROCESS: OnceLock<String> = OnceLock::new();
+
 #[derive(Serialize)]
 struct DlpAlert {
     alert_type: String,
@@ -88,6 +90,12 @@ fn ensure_initialized(hinst_dll: *mut c_void) {
     INIT.get_or_init(|| {
         #[cfg(target_os = "windows")]
         teardown::on_attach(hinst_dll as usize);
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(name) = exe_path.file_name().and_then(|n| n.to_str()) {
+                let _ = HOST_PROCESS.set(name.to_lowercase());
+            }
+        }
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1024);
         let _ = ALERT_SENDER.set(tx);
@@ -149,24 +157,24 @@ lazy_static! {
                     continue;
                 }
                 if in_regex_section && !trimmed.is_empty() && !trimmed.starts_with(';') {
-                            let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
-                            if parts.len() == 2 {
-                                let val = parts[1].trim();
-                                if !val.is_empty() {
-                                    match regex::Regex::new(val) {
-                                        Ok(re) if !(re.is_match("") && re.is_match("a") && re.is_match("0")) => {
-                                            regex_list.push(val.to_string());
-                                        }
-                                        Ok(_) => {
-                                            // Silently discard universal-match patterns — they match everything.
-                                        }
-                                        Err(_) => {
-                                            // Invalid regex — discard silently.
-                                        }
-                                    }
+                let parts: Vec<&str> = trimmed.splitn(2, '=').collect();
+                    if parts.len() == 2 {
+                        let val = parts[1].trim();
+                        if !val.is_empty() {
+                            match regex::Regex::new(val) {
+                                Ok(re) if val.len() > 3 && val != ".*" && val != ".+" && !(re.is_match("") && re.is_match("a") && re.is_match("0")) => {
+                                    regex_list.push(val.to_string());
+                                }
+                                Ok(_) => {
+                                    // Silently discard universal-match patterns — they match everything.
+                                }
+                                Err(_) => {
+                                    // Invalid regex — discard silently.
                                 }
                             }
                         }
+                    }
+                }
             }
         }
         if regex_list.is_empty() { regex_list.push(r"AKIA[0-9A-Z]{16}".to_string()); }
@@ -177,6 +185,13 @@ lazy_static! {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetFileType(hFile: *mut c_void) -> u32;
+
+    fn GetFinalPathNameByHandleW(
+        hFile: *mut c_void,
+        lpszFilePath: *mut u16,
+        cchFilePath: u32,
+        dwFlags: u32,
+    ) -> u32;
 
     fn CreateThread(
         lpThreadAttributes: *mut std::ffi::c_void,
@@ -237,7 +252,7 @@ const DLL_PROCESS_DETACH: u32 = 0;
 
 pub fn remove_hooks() {
     unsafe {
-        let _ = minhook_sys::MH_DisableHook(std::ptr::null_mut()); // Restore original bytes
+        let _ = minhook_sys::MH_DisableHook(std::ptr::null_mut());  // Restore original bytes
         let _ = minhook_sys::MH_Uninitialize();                     // Free trampoline heap
     }
 }
@@ -246,8 +261,9 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
     if n_bytes == 0 || lp_buffer.is_null() { return true; }
 
     let mut original_name = "intercepted_payload.dat".to_string();
+    let mut file_path_opt: Option<String> = None;
 
-    let file_path_opt: Option<String> = if let Some(nt_fn) = NT_QUERY_INFO_FILE.get() {
+    if let Some(nt_fn) = NT_QUERY_INFO_FILE.get() {
         let mut isb = IoStatusBlock { status: 0, information: 0 };
         let mut name_info = FileNameInfo { file_name_length: 0, file_name: [0u16; 512] };
         let status = nt_fn(h_file as isize, &mut isb,
@@ -258,20 +274,31 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
         if status == 0 || status == 0x80000005u32 as i32 {
             let len = (name_info.file_name_length / 2) as usize;
             let path_str = String::from_utf16_lossy(&name_info.file_name[..len.min(512)]);
-            if let Some(idx) = path_str.rfind('\\') {
-                original_name = path_str[idx + 1..].to_string();
-            } else if let Some(idx) = path_str.rfind('/') {
-                original_name = path_str[idx + 1..].to_string();
-            } else {
-                original_name = path_str.clone();
-            }
-            Some(path_str.to_lowercase())
-        } else { None }
-    } else { None };
+            file_path_opt = Some(path_str);
+        }
+    }
+
+    if file_path_opt.is_none() {
+        let mut path_buf = [0u16; 512];
+        let len = GetFinalPathNameByHandleW(h_file, path_buf.as_mut_ptr(), 512, 0);
+        if len > 0 && len < 512 {
+            let path_str = String::from_utf16_lossy(&path_buf[..len as usize]);
+            let clean_path = path_str.replace("\\\\?\\", "");
+            file_path_opt = Some(clean_path);
+        }
+    }
 
     let file_path = match file_path_opt {
-        Some(p) => p,
-        None => return true, // Can't resolve path — allow
+        Some(p) => {
+            let p_lower = p.to_lowercase();
+            if let Some(idx) = p_lower.rfind('\\') {
+                original_name = p_lower[idx + 1..].to_string();
+            } else if let Some(idx) = p_lower.rfind('/') {
+                original_name = p_lower[idx + 1..].to_string();
+            }
+            p_lower
+        },
+        None => return true, // Ensure raw sockets fall through
     };
 
     let is_own_path = file_path.contains("datasensor")
@@ -291,13 +318,22 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
         || file_path.ends_with(".db-wal")
         || file_path.ends_with(".db-shm")
         || file_path.ends_with(".etl")
-        || file_path.ends_with(".tmp")
         || file_path.ends_with(".db-journal")
-        || file_path.ends_with(".crdownload")
-        || file_path.ends_with(".partial")
         || file_path.contains("chrome\\user data");
 
-    if is_own_path || is_system_noise { return true; }
+    let host = HOST_PROCESS.get().map(|s| s.as_str()).unwrap_or("");
+
+    let is_atomic_stage = file_path.ends_with(".tmp")
+        || file_path.ends_with(".partial")
+        || file_path.ends_with(".crdownload");
+
+    let block_as_noise = if host == "pwsh.exe" || host == "powershell.exe" || host == "cmd.exe" {
+        is_system_noise
+    } else {
+        is_system_noise || is_atomic_stage
+    };
+
+    if is_own_path || block_as_noise { return true; }
 
     if file_path.ends_with(".zip") {
         let alert = DlpAlert {
@@ -309,9 +345,11 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
             mitre_tactic: "T1560 - Archive Collected Data".to_string(),
         };
         if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+            if let Some(sender) = ALERT_SENDER.get() {
+                let _ = sender.try_send(json_payload);
+            }
         }
-        return true; // Allow — orchestrator handles it
+        return true;
     }
 
     const MIN_INSPECT_BYTES: u32 = 16;
@@ -344,7 +382,9 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
             mitre_tactic: "T1560 - Archive Collected Data".to_string(),
         };
         if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+            if let Some(sender) = ALERT_SENDER.get() {
+                let _ = sender.try_send(json_payload);
+            }
         }
         return true;
     }
@@ -408,12 +448,14 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
             mitre_tactic: "T1485 - Data Destruction / Mitigation".to_string(),
         };
         if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+            if let Some(sender) = ALERT_SENDER.get() {
+                let _ = sender.try_send(json_payload);
+            }
         }
-        return false; // Block the write
+        return false;
     }
 
-    true // Allow
+    true
 }
 
 unsafe extern "system" fn hooked_ntwritefile(
@@ -456,14 +498,19 @@ pub extern "system" fn DllMain(hinst_dll: *mut c_void, fdw_reason: u32, _lpv_res
 
                 if minhook_sys::MH_Initialize() != 0 { return 1; }
 
-                let kernel32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
-                    b"kernelbase.dll\0".as_ptr()
-                );
-                if kernel32 == 0 { return 1; }
+                let mut write_file_addr: Option<unsafe extern "system" fn() -> isize> = None;
 
-                let write_file_addr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                    kernel32, b"WriteFile\0".as_ptr()
-                );
+                let h_kernelbase = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"kernelbase.dll\0".as_ptr());
+                if h_kernelbase != 0 {
+                    write_file_addr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(h_kernelbase, b"WriteFile\0".as_ptr());
+                }
+
+                if write_file_addr.is_none() {
+                    let h_kernel32 = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+                    if h_kernel32 != 0 {
+                        write_file_addr = windows_sys::Win32::System::LibraryLoader::GetProcAddress(h_kernel32, b"WriteFile\0".as_ptr());
+                    }
+                }
 
                 let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
                     b"ntdll.dll\0".as_ptr()

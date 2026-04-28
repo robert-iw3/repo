@@ -26,6 +26,7 @@ $LogDir = "C:\ProgramData\DataSensor\Logs"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 $global:LogFile = Join-Path $LogDir "DataSensor_Active.jsonl"
 $global:DiagFile = Join-Path $LogDir "DataSensor_Diagnostic.log"
+if (Test-Path $global:LogFile) { Clear-Content -Path $global:LogFile -Force -ErrorAction SilentlyContinue }
 if (Test-Path $global:DiagFile) { Clear-Content -Path $global:DiagFile -Force -ErrorAction SilentlyContinue }
 $TeardownSig = "C:\ProgramData\DataSensor\Teardown.sig"
 if (Test-Path $TeardownSig) { Remove-Item -Path $TeardownSig -Force -ErrorAction SilentlyContinue }
@@ -363,7 +364,7 @@ switch -Regex -File $ConfigPath {
     "^MaxInspectionSizeMB=(\d+)$"  { $MaxInspectionMB = [int]$matches[1]; continue }
     "^BaselineMinSamples=(\d+)$"   { $DlpConfig.ueba_min_samples = [int]$matches[1]; continue }
     "^ZScoreTrigger=([\d\.]+)$"    { $DlpConfig.ueba_z_score = [double]$matches[1]; continue }
-    "^TrustedProcesses=(.*)$"      { $TrustedProcs = $matches[1] -split ',' | ForEach-Object { $_.Trim().ToLower() }; continue }
+    "^TrustedProcesses=(.*)$"      { $TrustedProcs = $matches[1] -split ',' | ForEach-Object { $_.Trim().ToLower() -replace '\.exe$','' }; continue }
     "^MitigationConfidence=(\d+)$" { $DlpConfig.mitigation_confidence = [int]$matches[1]; continue }
 
     "^([^#;\[][^=]+)=(.*)$" {
@@ -480,6 +481,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         "System.Text.RegularExpressions",
         "System.Security.Principal.Windows",
         "System.Security.Claims",
+        "System.Security.Cryptography",
         "System.Net.Primitives",
         "netstandard"
     )
@@ -807,7 +809,7 @@ function Start-DataSensorHUD {
                         const fileName = value.split('\\').pop();
                         const displayValue = `<div style="display:flex; justify-content:space-between; align-items:center;">
                             <span style="font-family:'Consolas', monospace; color:var(--text-main); font-size:0.85rem;">${value}</span>
-                            <a href="./api/download/${fileName}" download style="background:var(--blue); color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-weight:bold; font-size:0.75rem; border:1px solid #388bfd; transition:0.2s; cursor:pointer;">DOWNLOAD EVIDENCE</a>
+                            <a href="./api/download/${encodeURIComponent(fileName)}" download style="background:var(--blue); color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-weight:bold; font-size:0.75rem; border:1px solid #388bfd; transition:0.2s; cursor:pointer;">DOWNLOAD EVIDENCE</a>
                         </div>`;
                         row.innerHTML = `<div class="detail-key">${key}</div><div class="detail-val" style="flex:1;">${displayValue}</div>`;
                     } else {
@@ -1218,12 +1220,10 @@ try {
     Write-Host "`n$cGold[*] Initiating Graceful Shutdown...$cReset"
     Write-Diag "Initiating Teardown Sequence..." "INFO"
 
-    $global:TeardownHandle = [System.IO.File]::Open($TeardownSig, 'Create', 'Write', 'Read')
-
     Write-Host "    [1/5] Writing File-Sentinel (Teardown.sig)..." -ForegroundColor Gray
 
     try {
-        $null | Out-File -FilePath $TeardownSig -Force -ErrorAction Stop
+        [System.IO.File]::WriteAllText($TeardownSig, '')
         Write-Diag "Teardown.sig written to $TeardownSig" "INFO"
     } catch {
         Write-Host "    [!] WARNING: Could not write Teardown.sig: $_" -ForegroundColor Yellow
@@ -1264,15 +1264,6 @@ try {
                 try { (Get-Process -Id $_.Handle -ErrorAction SilentlyContinue).ProcessName } catch { "pid?" }
             }) -join ", "
             Write-Host "    [2/5] Still active in: $StillIn — waiting..." -ForegroundColor DarkYellow
-        }
-
-        if (-not $EjectionClean) {
-            Write-Host "    [!] Hook ejection timeout after ${MaxWaitMs}ms. Forcing active Ring-3 ejection..." -ForegroundColor Yellow
-            Write-Diag "Hook teardown TIMEOUT. Initiating active C# closed-loop ejection." "WARN"
-
-            [RealTimeDataSensor]::ForceEjectHooks()
-
-            Start-Sleep -Milliseconds 1000
         }
     }
 

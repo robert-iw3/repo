@@ -375,7 +375,14 @@ pub extern "C" fn free_string(s: *mut c_char) {
 
 #[no_mangle]
 pub extern "C" fn teardown_engine(engine_ptr: *mut Mutex<DlpEngine>) {
-    if !engine_ptr.is_null() { unsafe { let _ = Box::from_raw(engine_ptr); } }
+    if !engine_ptr.is_null() {
+        let engine_box = unsafe { Box::from_raw(engine_ptr) };
+        let engine = match engine_box.into_inner() {
+            Ok(e) => e,
+            Err(p) => p.into_inner(),
+        };
+        let _ = engine.db_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
 }
 
 #[no_mangle]
