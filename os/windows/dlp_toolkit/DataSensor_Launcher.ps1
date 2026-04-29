@@ -44,7 +44,7 @@ function Write-Diag {
 
     if ((Test-Path $global:LogFile) -and ((Get-Item $global:LogFile).Length -gt 50MB)) {
         $ArchiveName = "DataSensor_$(Get-Date -Format 'yyyyMMdd_HHmmss').jsonl"
-        Rename-Item -Path $global:LogFile -NewName $ArchiveName -Force
+        Rename-Item -Path $global:LogFile -NewName $ArchiveName -Force -ErrorAction SilentlyContinue
     }
 
     $CleanMessage = $Message -replace "`r", "" -replace "`n", " "
@@ -483,6 +483,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
         "System.Security.Claims",
         "System.Security.Cryptography",
         "System.Net.Primitives",
+        "Microsoft.Win32.Primitives",
         "netstandard"
     )
 } else {
@@ -718,8 +719,8 @@ function Start-DataSensorHUD {
             </div>
             <div class="toolbar">
                 <div class="tabs">
-                    <button class="tab active" id="tab-core" onclick="setTab('core')">Security Events (<span id="count-core">0</span>)</button>
-                    <button class="tab" id="tab-ueba" onclick="setTab('ueba')">UEBA Anomalies (<span id="count-ueba">0</span>)</button>
+                    <button class="tab active" id="tab-core" onclick="setTab('core')">Generated Alerts (<span id="count-core">0</span>)</button>
+                    <button class="tab" id="tab-ueba" onclick="setTab('ueba')">UEBA Tracker (<span id="count-ueba">0</span>)</button>
                     <button class="tab" id="tab-diag" onclick="setTab('diag')">Diagnostics (<span id="count-diag">0</span>)</button>
                 </div>
                 <input type="text" class="search-box" id="search" placeholder="Search processes, tactics, or details...">
@@ -751,7 +752,7 @@ function Start-DataSensorHUD {
         </div>
 
         <script>
-            let coreData = []; let uebaData = []; let diagData = []; let currentTab = 'core'; let totalCount = 0; let failCount = 0;
+            let coreData = []; let uebaData = []; let diagData = []; let currentTab = 'core'; let failCount = 0;
 
             function setTab(tab) {
                 currentTab = tab;
@@ -839,20 +840,37 @@ function Start-DataSensorHUD {
                     failCount = 0;
                     const json = await response.json();
 
-                    // Filter Data Sensor unified schema into 3 distinct panes
-                    const newCore = json.events.filter(e => e.Level === "ALERT" && (!e.Message || e.Message.indexOf("UEBA_ANOMALY") === -1));
-                    const newUeba = json.events.filter(e => e.Level === "ALERT" && e.Message && e.Message.indexOf("UEBA_ANOMALY") !== -1);
-                    const newDiag = json.events.filter(e => e.Level !== "ALERT");
+                    const normalizedEvents = json.events.map(e => {
+                        if (e.Action !== undefined) {
+                            const cmdText = e.CommandLine ? ` | Cmd: ${e.CommandLine}` : '';
+                            const portText = e.DestPort ? `:${e.DestPort}` : '';
+                            const procFlow = e.ParentProcess ? `${e.ParentProcess} -> ${e.Process}` : e.Process;
 
-                    const newTotal = json.events.length;
-                    const latestTimestamp = json.events.length > 0 ? json.events[0].Timestamp : "";
+                            return {
+                                Timestamp: e.Timestamp,
+                                Level: "INFO",
+                                Component: "UEBA",
+                                Process: procFlow,
+                                Tactic: e.Action, // Re-purpose Tactic column for the Behavioral Action
+                                Message: `UEBA_TELEMETRY | User: ${e.User} | Dest: ${e.Destination}${portText} | Bytes: ${e.Bytes}${cmdText}`
+                            };
+                        }
+                        return e;
+                    });
 
-                    if (newTotal !== totalCount || latestTimestamp !== window.lastRenderedTime) {
+                    // Route data strictly to designated panes
+                    const newCore = normalizedEvents.filter(e => e.Level === "ALERT" && (!e.Message || e.Message.indexOf("UEBA_") === -1));
+                    const newUeba = normalizedEvents.filter(e => e.Component === "UEBA" || (e.Message && e.Message.indexOf("UEBA_") !== -1));
+                    const newDiag = normalizedEvents.filter(e => e.Level !== "ALERT" && e.Component !== "UEBA");
+
+                    const getNewest = (arr) => arr.length > 0 ? arr[arr.length - 1].Timestamp : "";
+                    const stateHash = `${json.events.length}-${getNewest(newCore)}-${getNewest(newUeba)}-${getNewest(newDiag)}`;
+
+                    if (stateHash !== window.lastRenderedState) {
                         coreData = newCore;
                         uebaData = newUeba;
                         diagData = newDiag;
-                        totalCount = newTotal;
-                        window.lastRenderedTime = latestTimestamp;
+                        window.lastRenderedState = stateHash;
 
                         document.getElementById('count-core').innerText = coreData.length;
                         document.getElementById('count-ueba').innerText = uebaData.length;
@@ -933,6 +951,23 @@ function Start-DataSensorHUD {
                             $Lines = $allText -split "`n" | Select-Object -Last 200
                             if ($Lines) {
                                 foreach ($line in $Lines) {
+                                    if ($line.Trim().StartsWith("{")) { $Events.Add($line.Trim()) }
+                                }
+                            }
+                        } catch { }
+                    }
+
+                    $UebaPath = $LogFile.Replace("DataSensor_Active.jsonl", "DataSensor_UEBA.jsonl")
+                    if (Test-Path $UebaPath) {
+                        try {
+                            $fs2 = New-Object System.IO.FileStream($UebaPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                            $sr2 = New-Object System.IO.StreamReader($fs2)
+                            $uebaText = $sr2.ReadToEnd()
+                            $sr2.Close(); $fs2.Close()
+
+                            $UebaLines = $uebaText -split "`n" | Select-Object -Last 200
+                            if ($UebaLines) {
+                                foreach ($line in $UebaLines) {
                                     if ($line.Trim().StartsWith("{")) { $Events.Add($line.Trim()) }
                                 }
                             }
@@ -1046,7 +1081,7 @@ try {
                 Add-AlertMessage "MITIGATION ENACTED: $($evt.RawJson)" $cGreen
             }
             elseif ($evt.EventType -eq "DLP_ALERT" -or $evt.EventType -eq "UEBA_ALERT") {
-                $ts = (Get-Date).ToString("HH:mm:ss")
+                $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
                 $parsed = $evt.RawJson | ConvertFrom-Json
 
                 <#
@@ -1109,7 +1144,8 @@ try {
 
                     $outMsg = "[$ts] $mitre | $($alert.alert_type) | [$contextIndicator] $ActionUser@$($evt.ProcessName) | $($alert.details)"
 
-                    $SiemObject = @{ timestamp = $ts; host = $env:COMPUTERNAME; user = $Identity; process = $evt.ProcessName; alert = $alert } | ConvertTo-Json -Compress
+                    $SpoolProcess = if ($alert.process -and $alert.process -ne '') { $alert.process } else { $evt.ProcessName }
+                    $SiemObject = @{ timestamp = $ts; host = $env:COMPUTERNAME; event_type = $evt.EventType; user = $ActionUser; process = $SpoolProcess; alert = $alert } | ConvertTo-Json -Compress
                     $SpoolFile = "C:\ProgramData\DataSensor\Data\OfflineSpool.jsonl"
                     Add-Content -Path $SpoolFile -Value $SiemObject -ErrorAction SilentlyContinue
 
@@ -1220,8 +1256,21 @@ try {
     Write-Host "`n$cGold[*] Initiating Graceful Shutdown...$cReset"
     Write-Diag "Initiating Teardown Sequence..." "INFO"
 
-    Write-Host "    [1/5] Writing File-Sentinel (Teardown.sig)..." -ForegroundColor Gray
+    Write-Host "    [1/5] Pre-creating HooksDetached rendezvous event..." -ForegroundColor Gray
+    $HooksDetachedEvent = $null
+    try {
+        $HooksDetachedEvent = New-Object System.Threading.EventWaitHandle(
+            $false,
+            [System.Threading.EventResetMode]::ManualReset,
+            'Global\DataSensorHooksDetached'
+        )
+        Write-Diag "Global\DataSensorHooksDetached event created." "INFO"
+    } catch {
+        Write-Host "    [!] WARNING: Could not create HooksDetached event: $_" -ForegroundColor Yellow
+        Write-Diag "WARNING: Could not create HooksDetached event: $_" "WARN"
+    }
 
+    Write-Host "    [1/5] Writing File-Sentinel (Teardown.sig)..." -ForegroundColor Gray
     try {
         [System.IO.File]::WriteAllText($TeardownSig, '')
         Write-Diag "Teardown.sig written to $TeardownSig" "INFO"
@@ -1232,44 +1281,59 @@ try {
 
     Write-Host "    [2/5] Waiting for Ring-3 Hooks to self-eject..." -ForegroundColor Gray
 
-    $HookDllName   = "DataSensor_Hook.dll"
-    $MaxWaitMs     = 6000
-    $PollMs        = 300
-    $ElapsedMs     = 0
     $EjectionClean = $false
-
-    while ($ElapsedMs -lt $MaxWaitMs) {
-        Start-Sleep -Milliseconds $PollMs
-        $ElapsedMs += $PollMs
-
-        $StillLoaded = @(
-            Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { $_.Id -gt 4 } |
-            ForEach-Object {
-                try { $_.Modules | Where-Object { $_.ModuleName -ieq $HookDllName } }
-                catch { $null }
-            } |
-            Where-Object { $null -ne $_ }
-        )
-
-        if ($StillLoaded.Count -eq 0) {
+    if ($HooksDetachedEvent) {
+        $signaled = $HooksDetachedEvent.WaitOne(6000)
+        if ($signaled) {
             $EjectionClean = $true
-            Write-Host "    [2/5] All hook instances ejected. ($ElapsedMs ms)" -ForegroundColor Green
-            Write-Diag "All DataSensor_Hook.dll instances confirmed ejected after $ElapsedMs ms." "INFO"
-            break
+            Write-Host "    [2/5] HooksDetached event received — all hooks cleanly ejected." -ForegroundColor Green
+            Write-Diag "Rust sentinel signalled HooksDetached. Clean ejection confirmed." "INFO"
+        } else {
+            Write-Host "    [!] HooksDetached timeout (6 000 ms). Falling back to module scan..." -ForegroundColor Yellow
+            Write-Diag "HooksDetached WaitOne timeout. Falling back to module poll." "WARN"
         }
-
-        if ($ElapsedMs % 1000 -lt $PollMs) {
-            $StillIn = @($StillLoaded | ForEach-Object {
-                try { (Get-Process -Id $_.Handle -ErrorAction SilentlyContinue).ProcessName } catch { "pid?" }
-            }) -join ", "
-            Write-Host "    [2/5] Still active in: $StillIn — waiting..." -ForegroundColor DarkYellow
-        }
+        #$HooksDetachedEvent.Dispose()
     }
 
     if (-not $EjectionClean) {
-        Write-Host "    [!] Hook ejection timeout after ${MaxWaitMs}ms. Some processes may retain the hook." -ForegroundColor Yellow
-        Write-Diag "Hook teardown TIMEOUT after ${MaxWaitMs}ms. Proceeding with engine shutdown." "WARN"
+        $HookDllName = "DataSensor_Hook.dll"
+        $MaxWaitMs   = 4000
+        $PollMs      = 300
+        $ElapsedMs   = 0
+
+        while ($ElapsedMs -lt $MaxWaitMs) {
+            Start-Sleep -Milliseconds $PollMs
+            $ElapsedMs += $PollMs
+
+            $StillLoaded = @(
+                Get-Process -ErrorAction SilentlyContinue |
+                Where-Object { $_.Id -gt 4 } |
+                ForEach-Object {
+                    try { $_.Modules | Where-Object { $_.ModuleName -ieq $HookDllName } }
+                    catch { $null }
+                } |
+                Where-Object { $null -ne $_ }
+            )
+
+            if ($StillLoaded.Count -eq 0) {
+                $EjectionClean = $true
+                Write-Host "    [2/5] All hook instances ejected (module scan). ($ElapsedMs ms)" -ForegroundColor Green
+                Write-Diag "All DataSensor_Hook.dll instances ejected (module scan) after $ElapsedMs ms." "INFO"
+                break
+            }
+
+            if ($ElapsedMs % 1000 -lt $PollMs) {
+                $StillIn = @($StillLoaded | ForEach-Object {
+                    try { (Get-Process -Id $_.Handle -ErrorAction SilentlyContinue).ProcessName } catch { "pid?" }
+                }) -join ", "
+                Write-Host "    [2/5] Still active in: $StillIn — waiting..." -ForegroundColor DarkYellow
+            }
+        }
+
+        if (-not $EjectionClean) {
+            Write-Host "    [!] Hook ejection timeout. Some processes may retain the hook." -ForegroundColor Yellow
+            Write-Diag "Hook teardown TIMEOUT. Proceeding with engine shutdown." "WARN"
+        }
     }
 
     Write-Host "    [3/5] Terminating Web HUD Runspace & releasing port bindings..." -ForegroundColor Gray

@@ -31,16 +31,23 @@ public class RealTimeDataSensor {
     static extern bool SetDllDirectory(string lpPathName);
 
     // --- NATIVE RUST FFI BOUNDARIES (ML ENGINE) ---
+    // --- NATIVE RUST FFI BOUNDARIES (ML ENGINE) ---
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     public struct FfiPlatformEvent {
         public string timestamp;
         public string event_type;
+        public string action;
         public string user;
         public string process;
+        public string parent_process;
+        public string command_line;
         public string filepath;
         public string destination;
+        public string dest_port;
+        public string details;
         public long bytes;
         public long duration_ms;
+        public bool is_dlp_hit;
     }
 
     [DllImport("DataSensor_ML.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -56,7 +63,12 @@ public class RealTimeDataSensor {
     private static extern void teardown_engine(IntPtr engine);
 
     [DllImport("DataSensor_ML.dll", CallingConvention = CallingConvention.Cdecl)]
-    private static extern IntPtr scan_text_payload(IntPtr engine, string text, string process, string user);
+    private static extern IntPtr scan_text_payload(
+        IntPtr engine,
+        string textPayload,
+        string sourceProcess,
+        string userName,
+        string sourceFilepath);
 
     [DllImport("DataSensor_ML.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int groom_database(IntPtr engine, uint days_to_keep);
@@ -171,7 +183,9 @@ public class RealTimeDataSensor {
     private static TraceEventSession _session;
     private static CancellationTokenSource _cts = new CancellationTokenSource();
     private static bool _enableUniversalLedger = false;
+    private static ManualResetEventSlim _batchProcessorDone = new ManualResetEventSlim(false);
     private static string _hookDllPath = @"C:\ProgramData\DataSensor\Bin\DataSensor_Hook.dll";
+    byte[] dllBytes = Encoding.Unicode.GetBytes(_hookDllPath + "\0");
 
     // --- WIN32 ACCESS RIGHT CONSTANTS ---
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -332,6 +346,15 @@ public class RealTimeDataSensor {
     public static void InjectRustHook(int targetPid) {
         if (_teardownRequested) return;
         if (!File.Exists(_hookDllPath)) return;
+
+        if (!IsSafeToInject(targetPid)) {
+            EventQueue.Enqueue(new DataEvent {
+                EventType = "WARN",
+                RawJson = $"InjectRustHook: ACG (ProhibitDynamicCode) active on PID {targetPid} — hook injection skipped"
+            });
+            return;
+        }
+
         if (!_injectedPids.TryAdd(targetPid, 0)) return;
 
         IntPtr hProcess = OpenProcess(INJECT_ACCESS, false, targetPid);
@@ -362,7 +385,37 @@ public class RealTimeDataSensor {
             if (hThread != IntPtr.Zero) {
                 WaitForSingleObject(hThread, 5000);
                 CloseHandle(hThread);
-                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: Injection complete for PID {targetPid}" });
+
+                // Allow OS PEB to stabilize after LoadLibraryW completes
+                System.Threading.Thread.Sleep(100);
+
+                bool isLoaded = false;
+                try {
+                    using (var targetProc = System.Diagnostics.Process.GetProcessById(targetPid)) {
+                        foreach (System.Diagnostics.ProcessModule mod in targetProc.Modules) {
+                            if (mod.ModuleName.Equals("DataSensor_Hook.dll", StringComparison.OrdinalIgnoreCase)) {
+                                isLoaded = true;
+                                break;
+                            }
+                        }
+                    }
+                } catch (System.ComponentModel.Win32Exception) {
+                    // Access Denied (PPL/Protected process). If CreateRemoteThread succeeded but verification
+                    // is denied, assume success to prevent blocking. The IPC pipe will confirm natively.
+                    isLoaded = true;
+                    EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: Access denied enumerating modules for PID {targetPid} - assuming success." });
+                } catch (Exception ex) {
+                    isLoaded = false;
+                    EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: Module check fault for PID {targetPid}: {ex.Message}" });
+                }
+
+                if (isLoaded) {
+                    EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: Injection confirmed for PID {targetPid}" });
+                } else {
+                    // Remove from injected set to unlock future ETW retry attempts
+                    _injectedPids.TryRemove(targetPid, out _);
+                    EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: LoadLibrary completed but DLL not found in PID {targetPid} — primed for retry" });
+                }
             }
         } finally {
             if (allocMemAddress != IntPtr.Zero)
@@ -392,11 +445,30 @@ public class RealTimeDataSensor {
 
     public static void ForceEjectHooks() {
         try {
-            using (EventWaitHandle teardownEvent = new EventWaitHandle(false, EventResetMode.ManualReset, @"Global\DataSensorTeardown", out bool createdNew)) {
+            bool signaled = false;
+
+            using (EventWaitHandle hooksDetached = new EventWaitHandle(
+                       false,
+                       EventResetMode.ManualReset,
+                       @"Global\DataSensorHooksDetached",
+                       out _))
+            using (EventWaitHandle teardownEvent = new EventWaitHandle(
+                       false,
+                       EventResetMode.ManualReset,
+                       @"Global\DataSensorTeardown",
+                       out _))
+            {
+                File.WriteAllText(@"C:\ProgramData\DataSensor\Teardown.sig", "");
                 teardownEvent.Set();
+                signaled = hooksDetached.WaitOne(6000);
             }
-            // Allow 1.5s for the Rust sentinels to intercept the signal, disable MH_HOOKS, and safely drain IN_FLIGHT threads.
-            Thread.Sleep(1500);
+
+            EventQueue.Enqueue(new DataEvent {
+                EventType = "DiagLog",
+                RawJson   = signaled
+                    ? "ForceEjectHooks: HooksDetached event received — all Rust hooks cleanly ejected."
+                    : "ForceEjectHooks: WaitOne timed out (6 000 ms). Proceeding with engine teardown."
+            });
         } catch {
             // Fail silently to allow graceful degradation rather than crashing the host
         }
@@ -441,118 +513,6 @@ public class RealTimeDataSensor {
             0,
             security);
     #endif
-    }
-
-    private static void StartNamedPipeListener() {
-        Task.Run(async () => {
-            while (!_cts.Token.IsCancellationRequested) {
-                try {
-                    var pipeServer = CreateSecurePipeServer();
-                    try { await pipeServer.WaitForConnectionAsync(_cts.Token); } catch { pipeServer.Dispose(); break; }
-
-                    _ = Task.Run(() => {
-                        try {
-                            using (var reader = new StreamReader(pipeServer)) {
-                                string alertJson = reader.ReadToEnd();
-                                if (!string.IsNullOrWhiteSpace(alertJson)) {
-
-                                    // --- DEEP ARCHIVE DELEGATION (ORCHESTRATOR INSPECTION) ---
-                                    if (alertJson.Contains("ASYNC_INSPECT_QUEUED")) {
-                                        EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "In-Band Hook", UserName = "System", RawJson = "{\"alerts\":[" + alertJson + "]}" });
-
-                                        string zipPath = alertJson.Split(new[] { "\"filepath\":\"" }, StringSplitOptions.None)[1].Split('"')[0];
-                                        Task.Run(() => {
-                                            try {
-                                                Thread.Sleep(1500); // Allow file locks to release
-                                                string tempDir = @"C:\ProgramData\DataSensor\TempArchive\" + Guid.NewGuid().ToString();
-                                                Directory.CreateDirectory(tempDir);
-
-                                                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = "TempArchive Extraction Initiated." });
-                                                string evDir = @"C:\ProgramData\DataSensor\Evidence";
-                                                Directory.CreateDirectory(evDir);
-
-                                                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, tempDir);
-
-                                                foreach (string file in Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories)) {
-                                                    try {
-                                                        byte[] buffer = File.ReadAllBytes(file);
-                                                        if (buffer.Length < 16) continue;
-
-                                                        string content = Encoding.UTF8.GetString(buffer);
-                                                        IntPtr alertPtr = scan_text_payload(_mlEnginePtr, content, "Archive_Extractor", "System");
-                                                        string resJson = Marshal.PtrToStringAnsi(alertPtr);
-
-                                                        if (!string.IsNullOrEmpty(resJson) && resJson.Contains("ACTION_REQUIRED")) {
-                                                            string fileName = Path.GetFileName(file);
-                                                            string hash;
-                                                            using (var sha = System.Security.Cryptography.SHA256.Create()) {
-                                                                hash = BitConverter.ToString(sha.ComputeHash(buffer)).Replace("-","").Substring(0,8).ToLowerInvariant();
-                                                            }
-                                                            string evName = $"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{hash}_{fileName}";
-                                                            string evPath = Path.Combine(evDir, evName);
-
-                                                            File.Copy(file, evPath, true);
-
-                                                            resJson = resJson.Replace("\"filepath\":\"\"", $"\"filepath\":\"{evPath.Replace("\\", "\\\\")}\"")
-                                                                             .Replace("\"FilePath\":\"\"", $"\"FilePath\":\"{evPath.Replace("\\", "\\\\")}\"");
-
-                                                            EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "Archive_Extractor", UserName = "System", RawJson = "{\"alerts\":[" + resJson + "]}" });
-                                                            Interlocked.Increment(ref _eventQueueCount);
-                                                        }
-                                                        free_string(alertPtr);
-                                                    } catch { }
-                                                }
-
-                                                Directory.Delete(tempDir, true);
-                                                File.Delete(zipPath);
-                                            } catch (Exception ex) {
-                                                EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Archive Extraction Failed: " + ex.Message });
-                                            }
-                                        });
-                                    }
-                                    else {
-                                        EventQueue.Enqueue(new DataEvent {
-                                            EventType = "DLP_ALERT",
-                                            ProcessName = "In-Band Hook",
-                                            UserName = "System",
-                                            RawJson = "{\"alerts\":[" + alertJson + "]}"
-                                        });
-                                        Interlocked.Increment(ref _eventQueueCount);
-
-                                        try {
-                                            string evtFilePath = "Unknown";
-                                            var fpParts = alertJson.Split(new[] { "\"filepath\":\"" }, StringSplitOptions.None);
-                                            if (fpParts.Length > 1) {
-                                                evtFilePath = fpParts[1].Split('"')[0].Replace("\\\\", "\\");
-                                            }
-                                            long evtBytes = 0;
-                                            try {
-                                                if (File.Exists(evtFilePath))
-                                                    evtBytes = new FileInfo(evtFilePath).Length;
-                                            } catch { }
-                                            var hookEvt = new FfiPlatformEvent {
-                                                timestamp   = DateTime.Now.ToString("O"),
-                                                event_type  = "File_IO",
-                                                user        = "HookEngine",
-                                                process     = "In-Band Hook",
-                                                filepath    = evtFilePath,
-                                                destination = "Disk_Write",
-                                                bytes       = evtBytes,
-                                                duration_ms = 1
-                                            };
-                                            if (!_uebaQueue.IsAddingCompleted) {
-                                                _uebaQueue.TryAdd(hookEvt, 50);
-                                                if (_enableUniversalLedger) { _uebaJsonQueue.TryAdd(hookEvt, 50); }
-                                            }
-                                        } catch { }
-                                    }
-                                }
-                            }
-                        } catch { } finally { if (pipeServer != null) { pipeServer.Dispose(); } }
-                    });
-                } catch { Thread.Sleep(100); }
-            }
-        });
     }
 
     // --- NETWORK HELPERS ---
@@ -636,6 +596,124 @@ public class RealTimeDataSensor {
         return lastFound;
     }
 
+    // --- WORKER THREADS ---
+
+    private static void StartNamedPipeListener() {
+        Task.Run(async () => {
+            while (!_cts.Token.IsCancellationRequested) {
+                try {
+                    var pipeServer = CreateSecurePipeServer();
+                    try { await pipeServer.WaitForConnectionAsync(_cts.Token); } catch { pipeServer.Dispose(); break; }
+
+                    _ = Task.Run(() => {
+                        try {
+                            using (var reader = new StreamReader(pipeServer)) {
+                                string alertJson = reader.ReadLine();
+                                if (!string.IsNullOrWhiteSpace(alertJson)) {
+
+                                    // --- DEEP ARCHIVE DELEGATION (ORCHESTRATOR INSPECTION) ---
+                                    if (alertJson.Contains("ASYNC_INSPECT_QUEUED")) {
+                                        EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "In-Band Hook", UserName = "System", RawJson = "{\"alerts\":[" + alertJson + "]}" });
+
+                                        string zipPath = alertJson.Split(new[] { "\"filepath\":\"" }, StringSplitOptions.None)[1].Split('"')[0];
+                                        Task.Run(() => {
+                                            try {
+                                                Thread.Sleep(1500); // Allow file locks to release
+                                                string tempDir = @"C:\ProgramData\DataSensor\TempArchive\" + Guid.NewGuid().ToString();
+                                                Directory.CreateDirectory(tempDir);
+
+                                                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = "TempArchive Extraction Initiated." });
+                                                string evDir = @"C:\ProgramData\DataSensor\Evidence";
+                                                Directory.CreateDirectory(evDir);
+
+                                                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, tempDir);
+
+                                                foreach (string file in Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories)) {
+                                                    try {
+                                                        byte[] buffer = File.ReadAllBytes(file);
+                                                        if (buffer.Length < 16) continue;
+
+                                                        string content = Encoding.UTF8.GetString(buffer);
+                                                        IntPtr alertPtr = scan_text_payload(_mlEnginePtr, content, "Archive_Extractor", "System", file);
+                                                        string resJson = Marshal.PtrToStringAnsi(alertPtr);
+
+                                                        if (!string.IsNullOrEmpty(resJson) && resJson.Contains("ACTION_REQUIRED")) {
+                                                            string fileName = Path.GetFileName(file);
+                                                            string hash;
+                                                            using (var sha = System.Security.Cryptography.SHA256.Create()) {
+                                                                hash = BitConverter.ToString(sha.ComputeHash(buffer)).Replace("-","").Substring(0,8).ToLowerInvariant();
+                                                            }
+                                                            string evName = $"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{hash}_{fileName}";
+                                                            string evPath = Path.Combine(evDir, evName);
+
+                                                            File.Copy(file, evPath, true);
+
+                                                            resJson = resJson.Replace(
+                                                                JsonEscape(file),
+                                                                JsonEscape(evPath));
+
+                                                            EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "Archive_Extractor", UserName = "System", RawJson = resJson });
+                                                            Interlocked.Increment(ref _eventQueueCount);
+                                                        }
+                                                        free_string(alertPtr);
+                                                    } catch { }
+                                                }
+
+                                                Directory.Delete(tempDir, true);
+                                                File.Delete(zipPath);
+                                            } catch (Exception ex) {
+                                                EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Archive Extraction Failed: " + ex.Message });
+                                            }
+                                        });
+                                    }
+                                    else {
+                                        EventQueue.Enqueue(new DataEvent {
+                                            EventType = "DLP_ALERT",
+                                            ProcessName = "In-Band Hook",
+                                            UserName = "System",
+                                            RawJson = "{\"alerts\":[" + alertJson + "]}"
+                                        });
+                                        Interlocked.Increment(ref _eventQueueCount);
+
+                                        try {
+                                            string evtFilePath = "Unknown";
+                                            var fpParts = alertJson.Split(new[] { "\"filepath\":\"" }, StringSplitOptions.None);
+                                            if (fpParts.Length > 1) {
+                                                evtFilePath = fpParts[1].Split('"')[0].Replace("\\\\", "\\");
+                                            }
+                                            long evtBytes = 0;
+                                            try {
+                                                if (File.Exists(evtFilePath))
+                                                    evtBytes = new FileInfo(evtFilePath).Length;
+                                            } catch { }
+                                            var hookEvt = new FfiPlatformEvent {
+                                                timestamp   = DateTime.Now.ToString("O"),
+                                                event_type  = "File_IO",
+                                                action      = "File_Write",
+                                                user        = Environment.UserName,
+                                                process     = "In-Band Hook",
+                                                filepath    = evtFilePath,
+                                                destination = "Disk_Write",
+                                                details     = alertJson.Contains("ASYNC_INSPECT_QUEUED") ? "Archive Creation Delegated" : "Disk Write Intercepted",
+                                                bytes       = evtBytes,
+                                                duration_ms = 1,
+                                                is_dlp_hit  = true
+                                            };
+                                            if (!_uebaQueue.IsAddingCompleted) {
+                                                _uebaQueue.TryAdd(hookEvt, 50);
+                                                if (_enableUniversalLedger) { _uebaJsonQueue.TryAdd(hookEvt, 50); }
+                                            }
+                                        } catch { }
+                                    }
+                                }
+                            }
+                        } catch { } finally { if (pipeServer != null) { pipeServer.Dispose(); } }
+                    });
+                } catch { Thread.Sleep(100); }
+            }
+        });
+    }
+
     private static void StartActiveNetworkMonitor() {
         Task.Run(() => {
             var seenConnections = new HashSet<string>();
@@ -655,11 +733,16 @@ public class RealTimeDataSensor {
                                     uint state = (uint)Marshal.ReadInt32(rowPtr);
                                     if (state == 5) { // MIB_TCP_STATE_ESTAB
                                         uint remoteAddr = (uint)Marshal.ReadInt32(rowPtr + 12);
+                                        int remotePortRaw = Marshal.ReadInt32(rowPtr + 16);
                                         int pid = Marshal.ReadInt32(rowPtr + 20);
 
                                         byte[] ip = BitConverter.GetBytes(remoteAddr);
                                         string destIp = $"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}";
-                                        string connId = $"{pid}-{destIp}";
+
+                                        // Port is stored in network byte order; shift bytes to read correctly
+                                        int destPort = ((remotePortRaw & 0xFF) << 8) | ((remotePortRaw >> 8) & 0xFF);
+
+                                        string connId = $"{pid}-{destIp}:{destPort}";
 
                                         if (!seenConnections.Contains(connId)) {
                                             seenConnections.Add(connId);
@@ -670,13 +753,18 @@ public class RealTimeDataSensor {
                                                 var evt = new FfiPlatformEvent {
                                                     timestamp = DateTime.Now.ToString("O"),
                                                     event_type = "Network",
+                                                    action = "TCP_Connection_Established",
                                                     user = GetProcessUser(pid),
                                                     process = procName,
+                                                    parent_process = "",
+                                                    command_line = "",
                                                     filepath = "Network_Socket",
                                                     destination = destIp,
-                                                    bytes = 1024, // Standard exfil footprint
+                                                    dest_port = destPort.ToString(),
+                                                    bytes = 0,
                                                     duration_ms = 1
                                                 };
+
                                                 if (!_uebaQueue.IsAddingCompleted) {
                                                     _uebaQueue.TryAdd(evt, 50);
                                                     if (_enableUniversalLedger) { _uebaJsonQueue.TryAdd(evt, 50); }
@@ -697,7 +785,6 @@ public class RealTimeDataSensor {
         });
     }
 
-    // --- WORKER THREADS ---
     private static void StartBatchProcessor() {
         Task.Run(() => {
             List<FfiPlatformEvent> batch = new List<FfiPlatformEvent>(5000);
@@ -717,7 +804,7 @@ public class RealTimeDataSensor {
                                 var e = batch[i];
                                 string safePath = JsonEscape(e.filepath);
                                 string safeDest = JsonEscape(e.destination);
-                                sb.Append($"{{\"timestamp\":\"{JsonEscape(e.timestamp)}\",\"user\":\"{JsonEscape(e.user)}\",\"process\":\"{JsonEscape(e.process)}\",\"filepath\":\"{safePath}\",\"destination\":\"{safeDest}\",\"bytes\":{e.bytes},\"duration_ms\":{e.duration_ms}}}");
+                                sb.Append($"{{\"event_type\":\"{JsonEscape(e.event_type ?? "")}\",\"action\":\"{JsonEscape(e.action ?? "")}\",\"timestamp\":\"{JsonEscape(e.timestamp)}\",\"user\":\"{JsonEscape(e.user)}\",\"process\":\"{JsonEscape(e.process)}\",\"parent_process\":\"{JsonEscape(e.parent_process ?? "")}\",\"command_line\":\"{JsonEscape(e.command_line ?? "")}\",\"filepath\":\"{safePath}\",\"destination\":\"{safeDest}\",\"dest_port\":\"{JsonEscape(e.dest_port ?? "")}\",\"bytes\":{e.bytes},\"duration_ms\":{e.duration_ms},\"is_dlp_hit\":{(e.is_dlp_hit ? "true" : "false")}}}");
                                 if (i < batch.Count - 1) sb.Append(",");
                             }
                             sb.Append("]");
@@ -727,13 +814,16 @@ public class RealTimeDataSensor {
                             batch.Clear();
                         }
                     }
+                    break;
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) {
                     EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Batch Processor Fault: " + ex.Message });
                     batch.Clear();
+                    // Do not break — transient faults should retry.
                 }
             }
+            _batchProcessorDone.Set();
         });
     }
 
@@ -772,16 +862,19 @@ public class RealTimeDataSensor {
 
                                     var evt = new FfiPlatformEvent {
                                         timestamp = DateTime.Now.ToString("O"),
+                                        event_type = "Clipboard",
+                                        action = "Clipboard_Copied",
                                         user = Environment.UserName,
                                         process = activeProcessName,
                                         filepath = "Clipboard_Capture",
                                         destination = "Memory_Buffer",
+                                        details = $"Payload Size: {currentText.Length} chars",
                                         bytes = currentText.Length * 2,
                                         duration_ms = 1
                                     };
 
                                     if (_mlEnginePtr != IntPtr.Zero) {
-                                        IntPtr alertPtr = scan_text_payload(_mlEnginePtr, currentText, activeProcessName, Environment.UserName);
+                                        IntPtr alertPtr = scan_text_payload(_mlEnginePtr, currentText, activeProcessName, Environment.UserName, "");
                                         string alertJson = Marshal.PtrToStringAnsi(alertPtr);
 
                                         if (!string.IsNullOrEmpty(alertJson) && alertJson.Contains("ACTION_REQUIRED")) {
@@ -827,19 +920,54 @@ public class RealTimeDataSensor {
     private static void StartUebaJsonLogger() {
         _uebaJsonWorker = new Thread(() => {
             string logPath = @"C:\ProgramData\DataSensor\Logs\DataSensor_UEBA.jsonl";
-            using (FileStream fs = new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite, 65536))
-            using (StreamWriter sw = new StreamWriter(fs) { AutoFlush = false }) {
-                while (!_cts.Token.IsCancellationRequested || _uebaJsonQueue.Count > 0) {
-                    try {
-                        foreach (var evt in _uebaJsonQueue.GetConsumingEnumerable(_cts.Token)) {
-                            string safePath = evt.filepath != null ? JsonEscape(evt.filepath) : "";
-                            string safeDest = evt.destination != null ? JsonEscape(evt.destination) : "";
-                            string jsonLine = $"{{\"Timestamp\":\"{JsonEscape(evt.timestamp)}\", \"User\":\"{JsonEscape(evt.user)}\", \"Process\":\"{JsonEscape(evt.process)}\", \"FilePath\":\"{safePath}\", \"Destination\":\"{safeDest}\", \"Bytes\":{evt.bytes}, \"DurationMs\":{evt.duration_ms}}}";
-                            sw.WriteLine(jsonLine);
+
+            while (!_cts.Token.IsCancellationRequested) {
+                try {
+                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(logPath));
+
+                    using (FileStream fs = new FileStream(
+                               logPath,
+                               FileMode.Append,
+                               FileAccess.Write,
+                               FileShare.ReadWrite, // allow concurrent reads (Web HUD)
+                               4096))               // small buffer — we control flushing explicitly
+                    using (StreamWriter sw = new StreamWriter(fs) { AutoFlush = false }) {
+
+                        while (!_cts.Token.IsCancellationRequested || _uebaJsonQueue.Count > 0) {
+                            try {
+                                foreach (var evt in _uebaJsonQueue.GetConsumingEnumerable(_cts.Token)) {
+                                    string safePath = evt.filepath    != null ? JsonEscape(evt.filepath)    : "";
+                                    string safeDest = evt.destination != null ? JsonEscape(evt.destination) : "";
+                                    string safeAction = evt.action    != null ? JsonEscape(evt.action)      : "";
+                                    string safeDetails= evt.details   != null ? JsonEscape(evt.details)     : "";
+
+                                    string jsonLine = $"{{\"Timestamp\":\"{JsonEscape(evt.timestamp)}\", \"EventType\":\"{JsonEscape(evt.event_type ?? "")}\", \"Action\":\"{safeAction}\", \"Host\":\"{JsonEscape(Environment.MachineName)}\", \"User\":\"{JsonEscape(evt.user)}\", \"Process\":\"{JsonEscape(evt.process)}\", \"FilePath\":\"{safePath}\", \"Destination\":\"{safeDest}\", \"Details\":\"{safeDetails}\", \"Bytes\":{evt.bytes}, \"DurationMs\":{evt.duration_ms}}}";
+                                    sw.WriteLine(jsonLine);
+
+                                    if (_uebaJsonQueue.Count == 0) {
+                                        sw.Flush();
+                                    }
+                                }
+                            }
+                            catch (OperationCanceledException) {
+                                try { sw.Flush(); } catch { }
+                                break;
+                            }
+                            catch {
+                                Thread.Sleep(200);
+                            }
                         }
-                        sw.Flush();
-                    } catch (OperationCanceledException) { break; }
-                    catch { Thread.Sleep(500); }
+
+                        try { sw.Flush(); } catch { } // final flush before FileStream disposes
+                    }
+                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception ex) {
+                    EventQueue.Enqueue(new DataEvent {
+                        EventType = "ERROR",
+                        RawJson   = "UEBA JSON Logger restarting after fault: " + ex.Message
+                    });
+                    Thread.Sleep(500);
                 }
             }
         });
@@ -858,6 +986,10 @@ public class RealTimeDataSensor {
                         bool isHighPriority = resultJson.Contains("ACTION_REQUIRED")
                                         || resultJson.Contains("NETWORK_INTEL")
                                         || resultJson.Contains("ASYNC_INSPECT_QUEUED");
+
+                        if (isHighPriority) {
+                            defaultAlertType = "DLP_ALERT";
+                        }
 
                         bool isNoisePath = resultJson.IndexOf("AppData", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                         resultJson.IndexOf("ProfileData", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -972,6 +1104,35 @@ public class RealTimeDataSensor {
                                     string procName = targetPid.ToString();
                                     try { procName = System.Diagnostics.Process.GetProcessById(targetPid).ProcessName; } catch {}
 
+                                    // --- UEBA: Capture Process Lineage & Command Line ---
+                                    string cmdLine = "";
+                                    string parentProcName = "Unknown";
+                                    try {
+                                        cmdLine = data.PayloadByName("CommandLine")?.ToString() ?? "";
+                                        object parentPidObj = data.PayloadByName("ParentProcessID");
+                                        if (parentPidObj != null) {
+                                            int parentPid = Convert.ToInt32(parentPidObj);
+                                            try { parentProcName = System.Diagnostics.Process.GetProcessById(parentPid).ProcessName; } catch {}
+                                        }
+                                    } catch {}
+
+                                    var procEvt = new FfiPlatformEvent {
+                                        timestamp = DateTime.Now.ToString("O"),
+                                        event_type = "Process",
+                                        action = "Process_Created",
+                                        user = userName,
+                                        process = procName,
+                                        parent_process = parentProcName,
+                                        command_line = cmdLine,
+                                        filepath = data.PayloadByName("ImageFileName")?.ToString() ?? "Unknown_Image",
+                                        destination = "Local_System",
+                                        bytes = 0,
+                                        duration_ms = 1
+                                    };
+                                    if (_enableUniversalLedger && !_uebaJsonQueue.IsAddingCompleted) {
+                                        _uebaJsonQueue.TryAdd(procEvt, 50);
+                                    }
+
                                     if (!_criticalSystemProcs.Contains(procName) && !_trustedProcesses.Contains(procName)) {
                                         Task.Run(async () => {
                                             int retries = 0;
@@ -983,13 +1144,14 @@ public class RealTimeDataSensor {
                                                     CloseHandle(hProc);
 
                                                     if (!is32Bit) {
+                                                        await Task.Delay(150);
                                                         InjectRustHook(targetPid);
                                                     }
                                                     break; // Injection executed, break the spin-wait loop
                                                 }
 
                                                 retries++;
-                                                await Task.Delay(1); // Wait 1ms for the OS to stabilize the new process
+                                                await Task.Delay(50); // Increased from 1ms to prevent CPU thrashing
                                             }
                                         });
                                     }
@@ -1108,11 +1270,13 @@ public class RealTimeDataSensor {
                                     var evt = new FfiPlatformEvent {
                                         timestamp = DateTime.Now.ToString("O"),
                                         event_type = "Network",
+                                        action = isDnsEvent ? "DNS_Query" : "TCP_Connection",
                                         user = GetProcessUser(data.ProcessID),
                                         process = procName,
                                         filepath = "Network_Socket",
                                         destination = finalDest,
-                                        bytes = size > 0 ? size : 1,
+                                        details = isDnsEvent ? $"Query: {query}" : $"RemoteIP: {destIp}",
+                                        bytes = size > 0 ? size : 0,
                                         duration_ms = 1
                                     };
 
@@ -1145,9 +1309,9 @@ public class RealTimeDataSensor {
     public static void StopSession() {
         _teardownRequested = true;
 
-        ForceEjectHooks();
+        _cts.Cancel();
 
-        Thread.Sleep(1000);
+        ForceEjectHooks();
 
         if (_session != null) {
             try { _session.Stop(); } catch { }
@@ -1158,21 +1322,29 @@ public class RealTimeDataSensor {
         _uebaQueue.CompleteAdding();
         _uebaJsonQueue.CompleteAdding();
 
-        int drainWaitMs = 0;
-        while (drainWaitMs < 3000) {
-            if (_uebaQueue.Count == 0 && _uebaJsonQueue.Count == 0) break;
-            Thread.Sleep(100);
-            drainWaitMs += 100;
+        if (_clipboardWorker != null && _clipboardWorker.IsAlive) {
+            _clipboardWorker.Join(2000);
+        }
+        if (_uebaJsonWorker != null && _uebaJsonWorker.IsAlive) {
+            _uebaJsonWorker.Join(2000);
         }
 
-        _cts.Cancel();
+        bool batchDone = _batchProcessorDone.Wait(8000);
+        if (!batchDone) {
+            EventQueue.Enqueue(new DataEvent {
+                EventType = "DiagLog",
+                RawJson   = "StopSession: batch processor drain timeout (8 000 ms) — proceeding with teardown."
+            });
+        }
+
+        Thread.Sleep(500);
 
         if (_mlEnginePtr != IntPtr.Zero) {
             teardown_engine(_mlEnginePtr);
             _mlEnginePtr = IntPtr.Zero;
             EventQueue.Enqueue(new DataEvent {
                 EventType = "DiagLog",
-                RawJson   = "Native Rust DLL safely unloaded and FFI pointers freed."
+                RawJson   = "Native Rust ML engine safely unloaded. WAL committed."
             });
         }
     }

@@ -77,6 +77,9 @@ static HOST_PROCESS: OnceLock<String> = OnceLock::new();
 #[derive(Serialize)]
 struct DlpAlert {
     alert_type: String,
+    action: String,
+    process: String,
+    destination: String,
     details: String,
     filepath: String,
     file_hash: String,
@@ -111,15 +114,34 @@ unsafe extern "system" fn ipc_worker(param: *mut std::ffi::c_void) -> u32 {
     let rx = Box::from_raw(param as *mut std::sync::mpsc::Receiver<String>);
     while !teardown::is_teardown_requested() {
         if let Ok(payload) = rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            let mut retries = 0;
-            while retries < 15 && !teardown::is_teardown_requested() {
+            let mut delay_ms: u64 = 20;
+            let mut retries = 0u32;
+
+            while retries < 8 && !teardown::is_teardown_requested() {
                 if let Ok(mut pipe) = OpenOptions::new().write(true).open(r"\\.\pipe\DataSensorAlerts") {
                     use std::io::Write;
-                    let _ = pipe.write_all(payload.as_bytes());
-                    break;
+                    let payload_nl = format!("{}\n", payload);
+                    let _ = pipe.write_all(payload_nl.as_bytes());
+                    break; // Delivered — exit retry loop
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+
+                // Exponential backoff: 20 → 40 → 80 → 160 → 320 → 640 → 1000 ms (cap)
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(1000);
                 retries += 1;
+            }
+
+            if retries == 8 {
+                if let Ok(mut f) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(r"C:\ProgramData\DataSensor\Logs\DataSensor_Diagnostic.log")
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(
+                        b"[DS-Hook] [WARN] ipc_worker: payload dropped after 8 retries (pipe busy).\n"
+                    );
+                }
             }
         }
     }
@@ -130,13 +152,18 @@ lazy_static! {
     static ref DLP_LITERALS: Vec<String> = {
         let mut keywords = Vec::new();
         if let Ok(config_data) = std::fs::read_to_string(r"C:\ProgramData\DataSensor\config.ini") {
+            let mut in_section = false;
             for line in config_data.lines() {
-                if line.starts_with("Classifications=") || line.starts_with("ProjectNames=") {
-                    let parts: Vec<&str> = line.split('=').collect();
-                    if parts.len() == 2 {
-                        for keyword in parts[1].split(',') {
-                            let kw = keyword.trim();
-                            if !kw.is_empty() { keywords.push(kw.to_string()); }
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    in_section = trimmed == "[DLP_LITERALS]";
+                    continue;
+                }
+                if in_section && !trimmed.is_empty() && !trimmed.starts_with(';') {
+                    if let Some(idx) = trimmed.find('=') {
+                        for kw in trimmed[idx + 1..].split(',') {
+                            let val = kw.trim();
+                            if !val.is_empty() { keywords.push(val.to_string()); }
                         }
                     }
                 }
@@ -180,6 +207,53 @@ lazy_static! {
         if regex_list.is_empty() { regex_list.push(r"AKIA[0-9A-Z]{16}".to_string()); }
         regex::RegexSet::new(&regex_list).unwrap_or_else(|_| regex::RegexSet::new(&[r"AKIA[0-9A-Z]{16}"]).unwrap())
     };
+
+    static ref FILE_EXTENSIONS: (Vec<String>, Vec<String>) = {
+        let mut archives = vec![".zip".to_string()];
+        let mut texts = vec![".txt".to_string(), ".csv".to_string()];
+
+        if let Ok(config_data) = std::fs::read_to_string(r"C:\ProgramData\DataSensor\config.ini") {
+            let mut in_section = false;
+            for line in config_data.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    in_section = trimmed == "[FILE_INSPECTION]";
+                    continue;
+                }
+                if !in_section { continue; }
+                if trimmed.starts_with("ArchiveTypes=") {
+                    archives = trimmed["ArchiveTypes=".len()..].split(',')
+                        .map(|s| s.trim().to_lowercase()).collect();
+                } else if trimmed.starts_with("TextTypes=") || trimmed.starts_with("DocumentTypes=") {
+                    let mut types: Vec<String> = trimmed[(trimmed.find('=').unwrap() + 1)..]
+                        .split(',').map(|s| s.trim().to_lowercase()).collect();
+                    texts.append(&mut types);
+                }
+            }
+        }
+        (archives, texts)
+    };
+
+    static ref TRUSTED_PROCESSES: std::collections::HashSet<String> = {
+        let mut procs = std::collections::HashSet::new();
+        if let Ok(config_data) = std::fs::read_to_string(r"C:\ProgramData\DataSensor\config.ini") {
+            let mut in_section = false;
+            for line in config_data.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    in_section = trimmed == "[EXCLUSIONS]";
+                    continue;
+                }
+                if in_section && trimmed.starts_with("TrustedProcesses=") {
+                    for p in trimmed["TrustedProcesses=".len()..].split(',') {
+                        let val = p.trim().to_lowercase();
+                        if !val.is_empty() { procs.insert(val); }
+                    }
+                }
+            }
+        }
+        procs
+    };
 }
 
 #[link(name = "kernel32")]
@@ -213,7 +287,8 @@ unsafe extern "system" fn hooked_write_file(
 ) -> i32 {
     ensure_initialized(HINST_DLL.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void);
 
-    if GetFileType(h_file) != FILE_TYPE_DISK {
+    let ftype = GetFileType(h_file);
+    if ftype != FILE_TYPE_DISK && ftype != 0 {
         return resume_original(h_file, lp_buffer, n_bytes, lp_bytes_written, lp_overlapped);
     }
     if n_bytes == 0 || lp_buffer.is_null() {
@@ -260,6 +335,8 @@ pub fn remove_hooks() {
 unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_bytes: u32) -> bool {
     if n_bytes == 0 || lp_buffer.is_null() { return true; }
 
+    let host_proc = HOST_PROCESS.get().map(|s| s.as_str()).unwrap_or("Unknown_Process").to_string();
+
     let mut original_name = "intercepted_payload.dat".to_string();
     let mut file_path_opt: Option<String> = None;
 
@@ -298,7 +375,7 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
             }
             p_lower
         },
-        None => return true, // Ensure raw sockets fall through
+        None => String::from("unknown_stream"),
     };
 
     let is_own_path = file_path.contains("datasensor")
@@ -327,7 +404,7 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
         || file_path.ends_with(".partial")
         || file_path.ends_with(".crdownload");
 
-    let block_as_noise = if host == "pwsh.exe" || host == "powershell.exe" || host == "cmd.exe" {
+    let block_as_noise = if host_proc == "pwsh.exe" || host_proc == "powershell.exe" || host_proc == "cmd.exe" {
         is_system_noise
     } else {
         is_system_noise || is_atomic_stage
@@ -335,9 +412,15 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
 
     if is_own_path || block_as_noise { return true; }
 
-    if file_path.ends_with(".zip") {
+    let ext = Path::new(&file_path).extension()
+        .and_then(|e| e.to_str()).map(|s| format!(".{}", s.to_lowercase())).unwrap_or_default();
+
+    if FILE_EXTENSIONS.0.contains(&ext) {
         let alert = DlpAlert {
             alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
+            action: "Archive_Delegation".to_string(),
+            process: host_proc.clone(),
+            destination: "Disk_Write".to_string(),
             details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
             filepath: file_path.clone(),
             file_hash: String::new(),
@@ -352,10 +435,49 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
         return true;
     }
 
+    let buffer_slice = std::slice::from_raw_parts(lp_buffer as *const u8, n_bytes as usize);
+
+    if buffer_slice.len() >= 4
+        && buffer_slice[0] == 0x50 && buffer_slice[1] == 0x4B
+        && buffer_slice[2] == 0x03 && buffer_slice[3] == 0x04 {
+
+        let evidence_dir = Path::new(r"C:\ProgramData\DataSensor\Evidence");
+        let _ = fs::create_dir_all(evidence_dir);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let mut hasher = Sha256::new();
+        hasher.update(buffer_slice);
+        let computed_hash = hex::encode(hasher.finalize());
+        let temp_zip_path = evidence_dir.join(format!("{}_{}_Intercepted.zip", timestamp, &computed_hash[0..8]));
+
+        if let Ok(mut file) = File::create(&temp_zip_path) {
+            let _ = file.write_all(buffer_slice);
+        }
+
+        let alert = DlpAlert {
+            alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
+            action: "Archive_Delegation".to_string(),
+            process: host_proc.clone(),
+            destination: "Disk_Write".to_string(),
+            details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
+            filepath: temp_zip_path.display().to_string(),
+            file_hash: computed_hash,
+            confidence: 50,
+            mitre_tactic: "T1560 - Archive Collected Data".to_string(),
+        };
+        if let Ok(json_payload) = serde_json::to_string(&alert) {
+            if let Some(sender) = ALERT_SENDER.get() { let _ = sender.try_send(json_payload); }
+        }
+        return true;
+    }
+
+    if !FILE_EXTENSIONS.1.contains(&ext) {
+        if TRUSTED_PROCESSES.contains(host) {
+            return true;
+        }
+    }
+
     const MIN_INSPECT_BYTES: u32 = 16;
     if n_bytes < MIN_INSPECT_BYTES { return true; }
-
-    let buffer_slice = std::slice::from_raw_parts(lp_buffer as *const u8, n_bytes as usize);
 
     let json_keys: &[&[u8]] = &[b"alert_type", b"DurationMs", b"Orchestrator", b"events"];
     let mut is_json_telemetry = false;
@@ -369,25 +491,6 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
     }
     let is_gzip = buffer_slice.len() > 2 && buffer_slice[0] == 0x1F && buffer_slice[1] == 0x8B;
     if is_gzip || buffer_slice.starts_with(b"H4sI") || is_json_telemetry { return true; }
-
-    if buffer_slice.len() >= 4
-        && buffer_slice[0] == 0x50 && buffer_slice[1] == 0x4B
-        && buffer_slice[2] == 0x03 && buffer_slice[3] == 0x04 {
-        let alert = DlpAlert {
-            alert_type: "ASYNC_INSPECT_QUEUED".to_string(),
-            details: "Archive created. Delegating to Orchestrator for deep inspection.".to_string(),
-            filepath: "Encrypted/Compressed Archive".to_string(),
-            file_hash: String::new(),
-            confidence: 50,
-            mitre_tactic: "T1560 - Archive Collected Data".to_string(),
-        };
-        if let Ok(json_payload) = serde_json::to_string(&alert) {
-            if let Some(sender) = ALERT_SENDER.get() {
-                let _ = sender.try_send(json_payload);
-            }
-        }
-        return true;
-    }
 
     let content_utf8 = String::from_utf8_lossy(buffer_slice);
     let content_utf16: Option<String> = if buffer_slice.len() >= 4 && buffer_slice.len() % 2 == 0 {
@@ -441,6 +544,9 @@ unsafe fn inspect_and_alert(h_file: *mut c_void, lp_buffer: *const c_void, n_byt
 
         let alert = DlpAlert {
             alert_type: "ACTION_REQUIRED".to_string(),
+            action: "File_Write_Blocked".to_string(),
+            process: host_proc.clone(),
+            destination: "Disk_Write".to_string(),
             details: format!("In-Band Write Blocked | {}", trigger_detail),
             filepath: evidence_path.display().to_string(),
             file_hash: computed_hash,
@@ -462,7 +568,10 @@ unsafe extern "system" fn hooked_ntwritefile(
     h_file: *mut c_void, h_event: *mut c_void, apc_routine: *mut c_void, apc_context: *mut c_void,
     io_status_block: *mut IoStatusBlock, buffer: *const c_void, length: u32, byte_offset: *mut i64, key: *mut u32,
 ) -> i32 {
-    if GetFileType(h_file) != FILE_TYPE_DISK || length == 0 || buffer.is_null() {
+    ensure_initialized(HINST_DLL.load(std::sync::atomic::Ordering::Relaxed) as *mut c_void);
+
+    let ftype = GetFileType(h_file);
+    if (ftype != FILE_TYPE_DISK && ftype != 0) || length == 0 || buffer.is_null() {
         if let Some(orig) = ORIGINAL_NTWRITEFILE.get() { return orig(h_file, h_event, apc_routine, apc_context, io_status_block, buffer, length, byte_offset, key); }
         return 0xC0000001u32 as i32;
     }
@@ -477,7 +586,7 @@ unsafe extern "system" fn hooked_ntwritefile(
 
     if !inspect_and_alert(h_file, buffer, length) {
         if !io_status_block.is_null() { (*io_status_block).information = 0; }
-        return 0xC0000022u32 as i32;
+        return 0xC0000022u32 as i32; // STATUS_ACCESS_DENIED
     }
 
     if let Some(orig) = ORIGINAL_NTWRITEFILE.get() {
@@ -489,12 +598,13 @@ unsafe extern "system" fn hooked_ntwritefile(
 #[no_mangle]
 #[allow(non_snake_case)]
 pub extern "system" fn DllMain(hinst_dll: *mut c_void, fdw_reason: u32, _lpv_reserved: *mut c_void) -> i32 {
-    match fdw_reason {
-        DLL_PROCESS_ATTACH => {
+    match fdw_reason {DLL_PROCESS_ATTACH => {
             unsafe {
                 windows_sys::Win32::System::LibraryLoader::DisableThreadLibraryCalls(hinst_dll as _);
 
                 HINST_DLL.store(hinst_dll as usize, std::sync::atomic::Ordering::Relaxed);
+
+                ensure_initialized(hinst_dll);
 
                 if minhook_sys::MH_Initialize() != 0 { return 1; }
 
@@ -512,9 +622,7 @@ pub extern "system" fn DllMain(hinst_dll: *mut c_void, fdw_reason: u32, _lpv_res
                     }
                 }
 
-                let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
-                    b"ntdll.dll\0".as_ptr()
-                );
+                let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(b"ntdll.dll\0".as_ptr());
                 if ntdll != 0 {
                     if let Some(fn_addr) = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
                         ntdll, b"NtQueryInformationFile\0".as_ptr()

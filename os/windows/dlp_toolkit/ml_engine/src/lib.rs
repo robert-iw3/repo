@@ -18,6 +18,8 @@ use regex::RegexSet;
 
 // --- CONFIGURATION & FFI STRUCTURES ---
 
+pub const ARCHIVE_EXTRACTOR_PROCESS: &str = "Archive_Extractor";
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct DlpConfig {
     pub strict_strings: Vec<String>,
@@ -27,18 +29,30 @@ pub struct DlpConfig {
     #[serde(default = "default_z_score")]
     pub ueba_z_score: f64,
 }
-fn default_min_samples() -> u64 { 25 }
-fn default_z_score() -> f64 { 3.5 }
+fn default_min_samples() -> u64 { 15 }
+fn default_z_score() -> f64 { 3.0 }
 
 #[derive(Deserialize)]
 pub struct FfiPlatformEvent {
     pub timestamp: String,
     pub user: String,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub action: String,
     pub process: String,
+    #[serde(default)]
+    pub parent_process: String,
+    #[serde(default)]
+    pub command_line: String,
     pub filepath: String,
     pub destination: String,
+    #[serde(default)]
+    pub dest_port: String,
     pub bytes: i64,
     pub duration_ms: i64,
+    #[serde(default)]
+    pub is_dlp_hit: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -113,7 +127,13 @@ pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpE
             FilePath TEXT,
             Destination TEXT,
             Bytes INTEGER,
-            Velocity REAL
+            Velocity REAL,
+            EventType TEXT DEFAULT '',
+            IsDlpHit INTEGER NOT NULL DEFAULT 0,
+            Action TEXT DEFAULT 'Unknown',
+            ParentProcess TEXT DEFAULT '',
+            CommandLine TEXT DEFAULT '',
+            DestPort TEXT DEFAULT ''
         )",
         []
     ).is_err() {
@@ -124,8 +144,13 @@ pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpE
     if !config_json.is_null() {
         let c_str = unsafe { CStr::from_ptr(config_json) };
         if let Ok(json_str) = c_str.to_str() {
-            if let Ok(parsed) = serde_json::from_str::<DlpConfig>(json_str) {
-                config = parsed;
+            match serde_json::from_str::<DlpConfig>(json_str) {
+                Ok(parsed) => config = parsed,
+                Err(e) => eprintln!(
+                    "[DataSensor ML] WARNING: Config JSON parse failed: {}. \
+                    Engine running with built-in defaults — thresholds will not match config.ini.",
+                    e
+                ),
             }
         }
     }
@@ -185,28 +210,27 @@ pub extern "C" fn process_telemetry_batch(
     };
     {
         let mut stmt = match tx.prepare_cached(
-            "INSERT INTO DataLedger (Timestamp, User, Process, FilePath, Destination, Bytes, Velocity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            "INSERT INTO DataLedger (Timestamp, User, Process, FilePath, Destination, Bytes, Velocity, EventType, IsDlpHit, Action, ParentProcess, CommandLine, DestPort) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ) {
             Ok(s) => s,
             Err(e) => return make_error_response(&format!("SQL Prepare Error: {}", e)),
         };
 
         for ffi_evt in events_slice {
-            let ts = ffi_evt.timestamp.clone();
             let usr = ffi_evt.user.clone();
             let proc = ffi_evt.process.clone();
             let path = ffi_evt.filepath.clone();
             let dest = ffi_evt.destination.clone();
             let bytes = ffi_evt.bytes;
 
-            if dest != "Disk_Write" && dest != "Clipboard" {
+            if ffi_evt.event_type == "Network" {
                 let matched_ioc = engine.strict_set.iter().find(|ioc| {
                     dest == ioc.as_str() || dest.ends_with(&format!(".{}", ioc))
                 });
                 if let Some(ioc) = matched_ioc {
                     alerts.push(DlpAlert {
-                        alert_type: "NETWORK_INTEL_VIOLATION".to_string(),
-                        details: format!("Outbound connection to Threat Intel Indicator: {}", ioc),
+                        alert_type: "ACTION_REQUIRED".to_string(),
+                        details: format!("NETWORK_INTEL_VIOLATION | Outbound connection to Threat Intel Indicator: {}", ioc),
                         user: Some(usr.clone()),
                         process: Some(proc.clone()),
                         filepath: Some(path.clone()),
@@ -223,7 +247,8 @@ pub extern "C" fn process_telemetry_batch(
                 bytes as f64
             };
 
-            if let Err(e) = stmt.execute(rusqlite::params![ts, usr, proc, path, dest, bytes, velocity]) {
+            let is_hit = ffi_evt.is_dlp_hit as i32;
+            if let Err(e) = stmt.execute(rusqlite::params![ffi_evt.timestamp, ffi_evt.user, ffi_evt.process, ffi_evt.filepath, ffi_evt.destination, ffi_evt.bytes, velocity, ffi_evt.event_type, is_hit, ffi_evt.action, ffi_evt.parent_process, ffi_evt.command_line, ffi_evt.dest_port]) {
                 return make_error_response(&format!("SQL Insert Error: {}", e));
             }
 
@@ -231,7 +256,8 @@ pub extern "C" fn process_telemetry_batch(
                 engine.user_baselines.clear();
             }
 
-            let baseline_key = format!("{}|{}", usr, dest);
+            let baseline_category = if ffi_evt.event_type == "Network" { &ffi_evt.destination } else { &ffi_evt.destination };
+            let baseline_key = format!("{}|{}|{}", ffi_evt.user, ffi_evt.action, baseline_category);
             let baseline = engine.user_baselines.entry(baseline_key).or_insert(UebaBaseline {
                 count: 0, mean_bytes: 0.0, m2_bytes: 0.0, mean_velocity: 0.0, m2_velocity: 0.0
             });
@@ -288,6 +314,7 @@ pub extern "C" fn scan_text_payload(
     text_payload: *const c_char,
     source_process: *const c_char,
     user_name: *const c_char,
+    source_filepath: *const c_char,
 ) -> *mut c_char {
     if engine_ptr.is_null() || text_payload.is_null() { return std::ptr::null_mut(); }
 
@@ -306,6 +333,12 @@ pub extern "C" fn scan_text_payload(
     let text = unsafe { CStr::from_ptr(text_payload).to_string_lossy() };
     let process = if source_process.is_null() { "System".to_string() } else { unsafe { CStr::from_ptr(source_process).to_string_lossy().into_owned() } };
     let user = if user_name.is_null() { "System".to_string() } else { unsafe { CStr::from_ptr(user_name).to_string_lossy().into_owned() } };
+
+    let filepath = if source_filepath.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(source_filepath).to_string_lossy().into_owned() }
+    };
 
     let mut matched = false;
     let mut trigger_detail = String::new();
@@ -327,15 +360,21 @@ pub extern "C" fn scan_text_payload(
 
     // 3. Return Alert if matched
     if matched {
+        let is_archive = process == ARCHIVE_EXTRACTOR_PROCESS;
+        let detail_msg = if is_archive { format!("Archive Content Match | {}", trigger_detail) } else { format!("Clipboard Intercepted | {}", trigger_detail) };
+        let fp = if is_archive { filepath.as_str() } else { "Clipboard_Capture" };
+        let dest = if is_archive { "Evidence_Vault" } else { "Memory_Buffer" };
+        let tactic = if is_archive { "T1560 - Archive Collected Data" } else { "T1056 - Collection" };
+
         let alert = DlpAlert {
             alert_type: "ACTION_REQUIRED".to_string(),
-            details: format!("Clipboard Intercepted | {}", trigger_detail),
+            details: detail_msg,
             confidence: 100,
-            mitre_tactic: "T1056 - Collection".to_string(),
+            mitre_tactic: tactic.to_string(),
             user: Some(user),
             process: Some(process),
-            filepath: Some("Clipboard_Capture".to_string()),
-            destination: Some("Memory_Buffer".to_string()),
+            filepath: Some(fp.to_string()),
+            destination: Some(dest.to_string()),
         };
         return serialize_response(vec![alert]);
     }
@@ -374,14 +413,53 @@ pub extern "C" fn free_string(s: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn teardown_engine(engine_ptr: *mut Mutex<DlpEngine>) {
-    if !engine_ptr.is_null() {
-        let engine_box = unsafe { Box::from_raw(engine_ptr) };
-        let engine = match engine_box.into_inner() {
-            Ok(e) => e,
-            Err(p) => p.into_inner(),
-        };
-        let _ = engine.db_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+pub extern "C" fn teardown_engine(engine_ptr: *mut std::sync::Mutex<DlpEngine>) {
+    if engine_ptr.is_null() {
+        return;
+    }
+
+    let engine_box = unsafe { Box::from_raw(engine_ptr) };
+    let mut engine = match engine_box.into_inner() {
+        Ok(e) => e,
+        Err(p) => p.into_inner(),
+    };
+
+    engine.db_conn.set_prepared_statement_cache_capacity(0);
+
+    let flushed = (|| -> bool {
+        for mode in &["FULL", "RESTART", "TRUNCATE"] {
+            for attempt in 0..5u32 {
+                let pragma = format!("PRAGMA wal_checkpoint({});", mode);
+                if let Ok(mut stmt) = engine.db_conn.prepare(&pragma) {
+                    if let Ok(mut rows) = stmt.query([]) {
+                        if let Ok(Some(row)) = rows.next() {
+                            let busy: i64 = row.get(0).unwrap_or(1);
+                            let log_frames: i64 = row.get(1).unwrap_or(-1);
+                            let ckpt_frames: i64 = row.get(2).unwrap_or(-1);
+                            if busy == 0 && log_frames == ckpt_frames {
+                                return true; // clean flush confirmed
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+            }
+        }
+        false
+    })();
+
+    if !flushed {
+        eprintln!("[DataSensor ML] WARNING: WAL checkpoint incomplete — forcing journal_mode=DELETE before close.");
+        let _ = engine.db_conn.execute_batch("PRAGMA journal_mode=DELETE;");
+    }
+
+    let db_conn = std::mem::replace(
+        &mut engine.db_conn,
+        Connection::open_in_memory().expect("in-memory fallback"),
+    );
+
+    if let Err(e) = db_conn.close() {
+        eprintln!("[DataSensor ML] WARNING: DB close returned error: {:?}", e);
     }
 }
 
@@ -406,11 +484,11 @@ pub extern "C" fn groom_database(
     let result = engine_guard.db_conn.execute(
         "DELETE FROM DataLedger
          WHERE julianday('now') - julianday(Timestamp) > ?1
+           AND IsDlpHit = 0
            AND Destination NOT IN (
                SELECT DISTINCT Destination FROM DataLedger
                WHERE julianday('now') - julianday(Timestamp) <= 3
-                 AND (FilePath = 'Clipboard_Capture'
-                      OR Bytes > 100000)
+                 AND IsDlpHit = 1
            )",
         rusqlite::params![cutoff_days],
     );

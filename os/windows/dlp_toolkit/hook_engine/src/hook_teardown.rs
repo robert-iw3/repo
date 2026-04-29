@@ -20,6 +20,13 @@
  * ensuring all in-flight I/O operations resolve safely before the
  * sentinel thread unmaps the library from memory.
  *
+ * 4. HOOKS-DETACHED HANDSHAKE — After all in-flight threads have drained, the sentinel
+ * opens the named event "Global\DataSensorHooksDetached" (pre-created
+ * by the C# orchestrator) and signals it. This replaces the
+ * non-deterministic Thread.Sleep(1500) in ForceEjectHooks() with a
+ * true rendezvous, preventing the orchestrator from calling
+ * teardown_engine() while Rust hooks are still executing.
+ *
  * @RW
  *============================================================================================*/
 
@@ -37,6 +44,7 @@ use windows_sys::Win32::System::LibraryLoader::FreeLibraryAndExitThread;
 
 const TEARDOWN_SIG_PATH: &str = r"C:\ProgramData\DataSensor\Teardown.sig";
 const POLL_INTERVAL_MS: u64 = 250;
+const HOOKS_DETACHED_EVENT: &str = "Global\\DataSensorHooksDetached\0";
 
 // ── GLOBAL STATE ─────────────────────────────────────────────────────────────
 
@@ -120,12 +128,15 @@ fn start_sentinel_watcher() {
 }
 
 fn sentinel_loop() {
+    HOOK_DEPTH.with(|depth| depth.set(1));
     loop {
         thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         if Path::new(TEARDOWN_SIG_PATH).exists() {
             TEARDOWN_REQUESTED.store(true, Ordering::SeqCst);
             log_diag("WARN", "Teardown signal detected. Closing entrance gate.");
             crate::remove_hooks();
+
+            // Drain all in-flight hook callbacks before signalling the orchestrator.
             let mut wait_cycles = 0;
             loop {
                 let active = IN_FLIGHT_THREADS.load(Ordering::SeqCst);
@@ -139,11 +150,45 @@ fn sentinel_loop() {
                 }
                 thread::sleep(Duration::from_millis(50));
             }
+
+            signal_hooks_detached();
+
             eject_self();
             return;
         }
     }
 }
+
+// ── HOOKS-DETACHED SIGNAL ────────────────────────────────────────────────────
+
+fn signal_hooks_detached() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::OpenEventW;
+        use windows_sys::Win32::System::Threading::SetEvent;
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        const EVENT_MODIFY_STATE: u32 = 0x0002;
+
+        let name_utf16: Vec<u16> = HOOKS_DETACHED_EVENT.encode_utf16().collect();
+        let h_event = OpenEventW(EVENT_MODIFY_STATE, 0, name_utf16.as_ptr());
+        if h_event != 0 {
+            SetEvent(h_event);
+            CloseHandle(h_event);
+            log_diag("INFO", "HooksDetached event signalled to C# orchestrator.");
+        } else {
+            // Orchestrator may have already timed-out and disposed the handle — non-fatal.
+            log_diag("WARN", "HooksDetached event not found (orchestrator may have timed out). Proceeding with ejection.");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        log_diag("INFO", "[STUB] signal_hooks_detached() — non-Windows build.");
+    }
+}
+
+// ── SELF-EJECTION ─────────────────────────────────────────────────────────────
 
 fn eject_self() {
     #[cfg(target_os = "windows")]
