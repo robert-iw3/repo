@@ -8,13 +8,15 @@
  * @RW
  *============================================================================================*/
 
+use lru::LruCache;
+use regex::RegexSet;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char};
+use std::num::NonZeroUsize;
+use std::os::raw::c_char;
 use std::sync::Mutex;
-use regex::RegexSet;
+use std::time::Instant;
 
 // --- CONFIGURATION & FFI STRUCTURES ---
 
@@ -24,13 +26,28 @@ pub const ARCHIVE_EXTRACTOR_PROCESS: &str = "Archive_Extractor";
 pub struct DlpConfig {
     pub strict_strings: Vec<String>,
     pub regex_patterns: Vec<String>,
+
+    // --- UEBA BASELINES ---
     #[serde(default = "default_min_samples")]
     pub ueba_min_samples: u64,
     #[serde(default = "default_z_score")]
     pub ueba_z_score: f64,
+
+    // --- MEMORY BOUNDS ---
+    #[serde(default = "default_max_entities")]
+    pub max_tracked_entities: usize,
+    #[serde(default = "default_decay_hours")]
+    pub state_decay_hours: u64,
+    #[serde(default = "default_min_bytes")]
+    pub min_trackable_bytes: i64,
 }
+
+// Serde Default Fallback Functions
 fn default_min_samples() -> u64 { 15 }
 fn default_z_score() -> f64 { 3.0 }
+fn default_max_entities() -> usize { 25000 }
+fn default_decay_hours() -> u64 { 24 }
+fn default_min_bytes() -> i64 { 512 }
 
 #[derive(Deserialize)]
 pub struct FfiPlatformEvent {
@@ -79,18 +96,19 @@ pub struct UebaBaseline {
     pub m2_bytes: f64,
     pub mean_velocity: f64,
     pub m2_velocity: f64,
+    pub last_seen: Instant,
 }
-
-// --- NATIVE ENGINE INITIALIZATION ---
 
 pub struct DlpEngine {
     pub db_conn: Connection,
     pub config: DlpConfig,
-    pub user_baselines: HashMap<String, UebaBaseline>,
+    pub user_baselines: LruCache<String, UebaBaseline>,
     pub regex_set: RegexSet,
     pub patterns: Vec<String>,
     pub strict_set: std::collections::HashSet<String>,
 }
+
+// --- NATIVE ENGINE INITIALIZATION ---
 
 #[no_mangle]
 pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpEngine> {
@@ -165,10 +183,13 @@ pub extern "C" fn init_dlp_engine(config_json: *const c_char) -> *mut Mutex<DlpE
     let patterns = config.regex_patterns.clone();
     let strict_set: std::collections::HashSet<String> = config.strict_strings.iter().cloned().collect();
 
+    let capacity = NonZeroUsize::new(config.max_tracked_entities)
+        .unwrap_or_else(|| NonZeroUsize::new(25000).unwrap());
+
     let engine = DlpEngine {
         db_conn: conn,
         config,
-        user_baselines: HashMap::new(),
+        user_baselines: LruCache::new(capacity),
         regex_set,
         patterns,
         strict_set,
@@ -252,15 +273,34 @@ pub extern "C" fn process_telemetry_batch(
                 return make_error_response(&format!("SQL Insert Error: {}", e));
             }
 
-            if engine.user_baselines.len() > 50_000 {
-                engine.user_baselines.clear();
+            if bytes < engine.config.min_trackable_bytes {
+                continue;
             }
 
             let baseline_category = if ffi_evt.event_type == "Network" { &ffi_evt.destination } else { &ffi_evt.destination };
             let baseline_key = format!("{}|{}|{}", ffi_evt.user, ffi_evt.action, baseline_category);
-            let baseline = engine.user_baselines.entry(baseline_key).or_insert(UebaBaseline {
-                count: 0, mean_bytes: 0.0, m2_bytes: 0.0, mean_velocity: 0.0, m2_velocity: 0.0
-            });
+
+            let now = Instant::now();
+            let mut reset_baseline = false;
+
+            if let Some(existing) = engine.user_baselines.get(&baseline_key) {
+                if now.duration_since(existing.last_seen).as_secs() > (engine.config.state_decay_hours * 3600) {
+                    reset_baseline = true;
+                }
+            }
+
+            if reset_baseline {
+                engine.user_baselines.pop(&baseline_key);
+            }
+
+            let baseline = engine.user_baselines.get_or_insert_mut(
+                baseline_key.clone(),
+                || UebaBaseline {
+                    count: 0, mean_bytes: 0.0, m2_bytes: 0.0, mean_velocity: 0.0, m2_velocity: 0.0, last_seen: now
+                }
+            );
+
+            baseline.last_seen = now;
 
             let pre_count = baseline.count;
             let pre_mean_b = baseline.mean_bytes;

@@ -349,7 +349,8 @@ $MaxInspectionMB = 150
 $TrustedProcs = @()
 $DlpConfig = @{
     strict_strings = @(); regex_patterns = @();
-    ueba_min_samples = 25; ueba_z_score = 3.5;
+    ueba_min_samples = 15; ueba_z_score = 3.0;
+    max_tracked_entities = 25000; state_decay_hours = 24; min_trackable_bytes = 512;
 }
 
 $currentSection = ""
@@ -366,6 +367,9 @@ switch -Regex -File $ConfigPath {
     "^ZScoreTrigger=([\d\.]+)$"    { $DlpConfig.ueba_z_score = [double]$matches[1]; continue }
     "^TrustedProcesses=(.*)$"      { $TrustedProcs = $matches[1] -split ',' | ForEach-Object { $_.Trim().ToLower() -replace '\.exe$','' }; continue }
     "^MitigationConfidence=(\d+)$" { $DlpConfig.mitigation_confidence = [int]$matches[1]; continue }
+    "^MaxTrackedEntities=(\d+)$"    { $DlpConfig.max_tracked_entities = [int]$matches[1]; continue }
+    "^StateDecayHours=(\d+)$"       { $DlpConfig.state_decay_hours = [int]$matches[1]; continue }
+    "^MinimumTrackableBytes=(\d+)$" { $DlpConfig.min_trackable_bytes = [int]$matches[1]; continue }
 
     "^([^#;\[][^=]+)=(.*)$" {
         $val = $matches[2].Trim()
@@ -810,7 +814,7 @@ function Start-DataSensorHUD {
                         const fileName = value.split('\\').pop();
                         const displayValue = `<div style="display:flex; justify-content:space-between; align-items:center;">
                             <span style="font-family:'Consolas', monospace; color:var(--text-main); font-size:0.85rem;">${value}</span>
-                            <a href="./api/download/${encodeURIComponent(fileName)}" download style="background:var(--blue); color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-weight:bold; font-size:0.75rem; border:1px solid #388bfd; transition:0.2s; cursor:pointer;">DOWNLOAD EVIDENCE</a>
+                            <a href="./api/download/${encodeURIComponent(fileName)}" download style="background:var(--blue); color:#fff; padding:6px 12px; border-radius:4px; text-decoration:none; font-weight:bold; font-size:0.75rem; border:1px solid #388bfd; transition:0.2s; cursor:pointer;">DOWNLOAD</a>
                         </div>`;
                         row.innerHTML = `<div class="detail-key">${key}</div><div class="detail-val" style="flex:1;">${displayValue}</div>`;
                     } else {
@@ -1067,14 +1071,30 @@ try {
                 #>
 
                 try {
-                    $ProcPath = (Get-Process -Name $evt.ProcessName -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path -First 1)
-                    if ($ProcPath) {
-                        $RuleName = "DATA_SENSOR_CONTAIN_$($evt.ProcessName)"
-                        New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Program $ProcPath -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
-                        Write-Diag -Message "Process Network Sockets Severed via Firewall API." -Level "INFO"
-                        $global:AlertQueue.Enqueue("[*] NETWORK CONTAINMENT ENACTED: Outbound sockets severed for $($evt.ProcessName)")
+                    $TargetProc = Get-Process -Name $evt.ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($TargetProc) {
+                        $ProcId = $TargetProc.Id
+                        $ProcPath = $TargetProc.Path
+
+                        $Suspended = [RealTimeDataSensor]::SuspendTargetProcess($ProcId)
+                        if ($Suspended) {
+                            Write-Diag -Message "Hermetic Seal Applied: Process Suspended (PID $ProcId)." -Level "WARN" -Tactic "T1485 - Data Destruction / Mitigation" -ProcessName $evt.ProcessName
+                        }
+
+                        if ($ProcPath) {
+                            $RuleName = "DATA_SENSOR_CONTAIN_$($evt.ProcessName)"
+                            New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Program $ProcPath -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
+                            Write-Diag -Message "Process Network Sockets Severed via Firewall API." -Level "INFO" -Tactic "T1485" -ProcessName $evt.ProcessName
+                        }
+
+                        Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+                        Write-Diag -Message "Threat Terminated: Process cleanly destroyed." -Level "WARN" -Tactic "T1485" -ProcessName $evt.ProcessName
+
+                        $global:AlertQueue.Enqueue("[*] HERMETIC CONTAINMENT ENACTED: Suspended, Severed, and Terminated $($evt.ProcessName)")
                     }
-                } catch {}
+                } catch {
+                    Write-Diag -Message "Hermetic Containment Fault: $_" -Level "ERROR"
+                }
 
                 $global:TotalMitigations++
                 $global:AlertQueue.Enqueue("[*] MITIGATION ENACTED: $($evt.RawJson)")
@@ -1114,12 +1134,25 @@ try {
                     if ($alert.details -match "CONTAINMENT_REQUIRED") {
                         if ($global:SensorMode -eq "Armed") {
                             try {
-                                $ProcPath = (Get-Process -Name $evt.ProcessName -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path -First 1)
-                                if ($ProcPath) {
-                                    $RuleName = "DATA_SENSOR_CONTAIN_$($evt.ProcessName)"
-                                    New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Program $ProcPath -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
-                                    Write-Diag -Message "Process Network Sockets Severed via Firewall API." -Level "WARN" -Tactic "T1485 - Data Destruction / Mitigation" -ProcessName $evt.ProcessName
-                                    Add-AlertMessage "NETWORK CONTAINMENT ENACTED: Outbound sockets severed for $($evt.ProcessName)" $cRed
+                                $TargetProc = Get-Process -Name $evt.ProcessName -ErrorAction SilentlyContinue | Select-Object -First 1
+                                if ($TargetProc) {
+                                    $ProcId = $TargetProc.Id
+                                    $ProcPath = $TargetProc.Path
+
+                                    $Suspended = [RealTimeDataSensor]::SuspendTargetProcess($ProcId)
+                                    if ($Suspended) {
+                                        Write-Diag -Message "Hermetic Seal Applied: Process Suspended (PID $ProcId)." -Level "WARN" -Tactic "T1485 - Data Destruction / Mitigation" -ProcessName $evt.ProcessName
+                                    }
+
+                                    if ($ProcPath) {
+                                        $RuleName = "DATA_SENSOR_CONTAIN_$($evt.ProcessName)"
+                                        New-NetFirewallRule -DisplayName $RuleName -Direction Outbound -Program $ProcPath -Action Block -Profile Any -ErrorAction SilentlyContinue | Out-Null
+                                        Write-Diag -Message "Process Network Sockets Severed via Firewall API." -Level "WARN" -Tactic "T1485" -ProcessName $evt.ProcessName
+                                    }
+
+                                    Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+
+                                    Add-AlertMessage "HERMETIC CONTAINMENT ENACTED: Suspended, Severed, and Terminated $($evt.ProcessName)" $cRed
                                     $global:TotalMitigations++
                                 }
                             } catch {}
@@ -1285,14 +1318,26 @@ try {
     if ($HooksDetachedEvent) {
         $signaled = $HooksDetachedEvent.WaitOne(6000)
         if ($signaled) {
+            $hookDllName = "DataSensor_Hook.dll"
+            $deadline = (Get-Date).AddSeconds(5)
             $EjectionClean = $true
-            Write-Host "    [2/5] HooksDetached event received — all hooks cleanly ejected." -ForegroundColor Green
-            Write-Diag "Rust sentinel signalled HooksDetached. Clean ejection confirmed." "INFO"
-        } else {
-            Write-Host "    [!] HooksDetached timeout (6 000 ms). Falling back to module scan..." -ForegroundColor Yellow
-            Write-Diag "HooksDetached WaitOne timeout. Falling back to module poll." "WARN"
+
+            while ((Get-Date) -lt $deadline) {
+                $stillLoaded = [RealTimeDataSensor]::GetInjectedPids() | Where-Object {
+                    try {
+                        (Get-Process -Id $_ -ErrorAction Stop).Modules |
+                            Where-Object { $_.ModuleName -ieq $hookDllName }
+                    } catch { $false }
+                }
+                if (-not $stillLoaded) { break }
+                $EjectionClean = $false
+                Start-Sleep -Milliseconds 200
+            }
+
+            if ($EjectionClean) {
+                Write-Host "    [2/5] HooksDetached quorum verified — all hooks cleanly ejected." -ForegroundColor Green
+            }
         }
-        #$HooksDetachedEvent.Dispose()
     }
 
     if (-not $EjectionClean) {

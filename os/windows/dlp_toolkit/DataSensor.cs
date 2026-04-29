@@ -31,7 +31,6 @@ public class RealTimeDataSensor {
     static extern bool SetDllDirectory(string lpPathName);
 
     // --- NATIVE RUST FFI BOUNDARIES (ML ENGINE) ---
-    // --- NATIVE RUST FFI BOUNDARIES (ML ENGINE) ---
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     public struct FfiPlatformEvent {
         public string timestamp;
@@ -118,6 +117,10 @@ public class RealTimeDataSensor {
     static extern bool QueryProcessMitigationPolicy(IntPtr hProcess, int MitigationPolicy, ref int lpBuffer, int dwLength);
     [DllImport("iphlpapi.dll", SetLastError = true)]
     static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int dwOutBufLen, bool sort, int ipVersion, int tblClass, uint reserved);
+    [DllImport("ntdll.dll", SetLastError = true)]
+    private static extern int NtSuspendProcess(IntPtr processHandle);
+
+    private const uint PROCESS_SUSPEND_RESUME = 0x0800;
 
     // --- USER P/INVOKES ---
     [DllImport("user32.dll", SetLastError = true)]
@@ -162,6 +165,8 @@ public class RealTimeDataSensor {
     private static Thread _clipboardWorker;
     private static Thread _uebaJsonWorker;
     private static ConcurrentDictionary<string, string> _volumeMap = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly int _selfPid = System.Diagnostics.Process.GetCurrentProcess().Id;
+    private static readonly string[] FilePathSplitter = new[] { "\"filepath\":\"" };
 
     public class DataEvent {
         public string EventType;
@@ -170,6 +175,7 @@ public class RealTimeDataSensor {
         public string RawJson;
     }
 
+    public static IEnumerable<int> GetInjectedPids() => _injectedPids.Keys;
     public static ConcurrentQueue<DataEvent> EventQueue = new ConcurrentQueue<DataEvent>();
     public static int _eventQueueCount = 0;
     private static int _networkDiagCount = 0;
@@ -239,52 +245,58 @@ public class RealTimeDataSensor {
     }
 
     public static void InjectExistingProcesses() {
-        Task.Run(() => {
-            var injectionTasks = new List<Task>();
+        Task.Run(async () => {
+            EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = "Starting continuous Ring-3 injection watchdog..." });
+            while (!_cts.Token.IsCancellationRequested) {
+                var injectionTasks = new List<Task>();
 
-            foreach (var proc in System.Diagnostics.Process.GetProcesses()) {
-                IntPtr hProc = IntPtr.Zero;
-                try {
-                    if (proc.Id <= 4 || proc.SessionId == 0) continue;
-                    string procName = proc.ProcessName;
-                    if (_criticalSystemProcs.Contains(procName)) continue;
-                    if (_trustedProcesses.Contains(procName)) continue;
+                foreach (var proc in System.Diagnostics.Process.GetProcesses()) {
+                    IntPtr hProc = IntPtr.Zero;
+                    try {
+                        if (proc.Id <= 4 || proc.SessionId == 0) continue;
+                        if (proc.Id == _selfPid) continue;
+                        if (_injectedPids.ContainsKey(proc.Id)) continue;
 
-                    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, proc.Id);
-                    if (hProc == IntPtr.Zero) continue;
+                        string procName = proc.ProcessName;
+                        if (_criticalSystemProcs.Contains(procName)) continue;
+                        if (_trustedProcesses.Contains(procName)) continue;
 
-                    bool shouldInject = true;
-                    uint capacity = 1024;
-                    StringBuilder exePath = new StringBuilder((int)capacity);
-                    if (QueryFullProcessImageName(hProc, 0, exePath, ref capacity)) {
-                        string fullPath = exePath.ToString().ToLower();
-                        bool isPowerShell = fullPath.Contains("powershell.exe") || fullPath.Contains("pwsh.exe");
+                        hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, proc.Id);
+                        if (hProc == IntPtr.Zero) continue;
 
-                        if (fullPath.StartsWith(@"c:\windows\") && !isPowerShell) shouldInject = false;
-                        if (fullPath.Contains(@"\windowsapps\") && !isPowerShell) shouldInject = false;
-                        if (fullPath.Contains("chrome.exe") || fullPath.Contains("msedge.exe")) shouldInject = false;
+                        bool shouldInject = true;
+                        uint capacity = 1024;
+                        StringBuilder exePath = new StringBuilder((int)capacity);
+                        if (QueryFullProcessImageName(hProc, 0, exePath, ref capacity)) {
+                            string fullPath = exePath.ToString().ToLower();
+                            bool isPowerShell = fullPath.Contains("powershell.exe") || fullPath.Contains("pwsh.exe");
+
+                            if (fullPath.StartsWith(@"c:\windows\") && !isPowerShell) shouldInject = false;
+                            if (fullPath.Contains(@"\windowsapps\") && !isPowerShell) shouldInject = false;
+                            if (fullPath.Contains("chrome.exe") || fullPath.Contains("msedge.exe")) shouldInject = false;
+                        }
+
+                        if (!shouldInject) { CloseHandle(hProc); hProc = IntPtr.Zero; continue; }
+
+                        IsWow64Process(hProc, out bool is32Bit);
+                        CloseHandle(hProc); hProc = IntPtr.Zero;
+
+                        if (!is32Bit) {
+                            int pid = proc.Id; // capture for closure
+                            injectionTasks.Add(Task.Run(() => InjectRustHook(pid)));
+                        }
+                    } catch {
+                    } finally {
+                        if (hProc != IntPtr.Zero) CloseHandle(hProc);
                     }
-
-                    if (!shouldInject) { CloseHandle(hProc); hProc = IntPtr.Zero; continue; }
-
-                    IsWow64Process(hProc, out bool is32Bit);
-                    CloseHandle(hProc); hProc = IntPtr.Zero;
-
-                    if (!is32Bit) {
-                        int pid = proc.Id; // capture for closure
-                        injectionTasks.Add(Task.Run(() => InjectRustHook(pid)));
-                    }
-                } catch {
-                } finally {
-                    if (hProc != IntPtr.Zero) CloseHandle(hProc);
                 }
-            }
 
-            Task.WaitAll(injectionTasks.ToArray());
-            EventQueue.Enqueue(new DataEvent {
-                EventType = "DiagLog",
-                RawJson = "Dynamic Ring-3 Hooks deployed to interactive user processes."
-            });
+                if (injectionTasks.Count > 0) {
+                    await Task.WhenAll(injectionTasks);
+                }
+
+                await Task.Delay(3000, _cts.Token);
+            }
         });
     }
 
@@ -346,6 +358,7 @@ public class RealTimeDataSensor {
     public static void InjectRustHook(int targetPid) {
         if (_teardownRequested) return;
         if (!File.Exists(_hookDllPath)) return;
+        if (targetPid == _selfPid) return;
 
         if (!IsSafeToInject(targetPid)) {
             EventQueue.Enqueue(new DataEvent {
@@ -353,6 +366,18 @@ public class RealTimeDataSensor {
                 RawJson = $"InjectRustHook: ACG (ProhibitDynamicCode) active on PID {targetPid} — hook injection skipped"
             });
             return;
+        }
+
+        // Prevent 64-bit DLL from injecting into 32-bit (WOW64) processes
+        IntPtr hCheck = OpenProcess(0x1000, false, targetPid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if (hCheck != IntPtr.Zero) {
+            bool isWow64 = false;
+            IsWow64Process(hCheck, out isWow64);
+            CloseHandle(hCheck);
+            if (isWow64) {
+                _injectedPids.TryRemove(targetPid, out _);
+                return;
+            }
         }
 
         if (!_injectedPids.TryAdd(targetPid, 0)) return;
@@ -383,6 +408,22 @@ public class RealTimeDataSensor {
             IntPtr hThread = CreateRemoteThread(hProcess, IntPtr.Zero, 0, loadLibraryAddr, allocMemAddress, 0, IntPtr.Zero);
 
             if (hThread != IntPtr.Zero) {
+                WaitForSingleObject(hThread, 5000);
+                CloseHandle(hThread);
+
+                // Assume success if thread executed to prevent infinite retry spam on managed processes
+                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: Injection command executed for PID {targetPid}" });
+            } else {
+                _injectedPids.TryRemove(targetPid, out _);
+                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = $"InjectRustHook: CreateRemoteThread FAILED for PID {targetPid}" });
+            }
+        } finally {
+            if (allocMemAddress != IntPtr.Zero)
+                VirtualFreeEx(hProcess, allocMemAddress, 0, 0x8000); // MEM_RELEASE
+            CloseHandle(hProcess);
+        }
+    }
+    /*        if (hThread != IntPtr.Zero) {
                 WaitForSingleObject(hThread, 5000);
                 CloseHandle(hThread);
 
@@ -423,6 +464,7 @@ public class RealTimeDataSensor {
             CloseHandle(hProcess);
         }
     }
+    */
 
     private static bool IsSafeToInject(int pid) {
         IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
@@ -472,6 +514,16 @@ public class RealTimeDataSensor {
         } catch {
             // Fail silently to allow graceful degradation rather than crashing the host
         }
+    }
+
+    public static bool SuspendTargetProcess(int pid) {
+        IntPtr hProc = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+        if (hProc == IntPtr.Zero) return false;
+
+        int status = NtSuspendProcess(hProc);
+        CloseHandle(hProc);
+
+        return status == 0; // NT_SUCCESS
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -615,18 +667,49 @@ public class RealTimeDataSensor {
                                     if (alertJson.Contains("ASYNC_INSPECT_QUEUED")) {
                                         EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "In-Band Hook", UserName = "System", RawJson = "{\"alerts\":[" + alertJson + "]}" });
 
-                                        string zipPath = alertJson.Split(new[] { "\"filepath\":\"" }, StringSplitOptions.None)[1].Split('"')[0];
-                                        Task.Run(() => {
-                                            try {
-                                                Thread.Sleep(1500); // Allow file locks to release
-                                                string tempDir = @"C:\ProgramData\DataSensor\TempArchive\" + Guid.NewGuid().ToString();
-                                                Directory.CreateDirectory(tempDir);
+                                        string zipPath = alertJson.Split(FilePathSplitter, StringSplitOptions.None)[1].Split('"')[0];
+                                        zipPath = zipPath.Replace("\\\\", "\\");
 
-                                                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = "TempArchive Extraction Initiated." });
+                                        if (zipPath.StartsWith("\\??\\") || zipPath.StartsWith("\\\\?\\")) {
+                                            zipPath = zipPath.Substring(4);
+                                        }
+
+                                        if (zipPath.StartsWith("\\") && !zipPath.StartsWith("\\\\")) {
+                                            string hostDrive = System.IO.Path.GetPathRoot(AppDomain.CurrentDomain.BaseDirectory);
+                                            zipPath = System.IO.Path.Combine(hostDrive, zipPath.TrimStart('\\'));
+                                        }
+
+                                        Task.Run(() => {
+                                            string tempDir = @"C:\ProgramData\DataSensor\TempArchive\" + Guid.NewGuid().ToString();
+
+                                            try {
+                                                Directory.CreateDirectory(tempDir);
                                                 string evDir = @"C:\ProgramData\DataSensor\Evidence";
                                                 Directory.CreateDirectory(evDir);
 
-                                                System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, tempDir);
+                                                EventQueue.Enqueue(new DataEvent { EventType = "DiagLog", RawJson = "TempArchive Extraction Initiated for: " + zipPath });
+
+                                                int retries = 6;
+                                                bool extracted = false;
+
+                                                while (retries > 0 && !extracted) {
+                                                    System.Threading.Thread.Sleep(1500); // Wait 1.5 seconds per loop
+                                                    try {
+                                                        if (File.Exists(zipPath)) {
+                                                            System.IO.Compression.ZipFile.ExtractToDirectory(zipPath, tempDir);
+                                                            extracted = true;
+                                                        } else {
+                                                            retries--;
+                                                        }
+                                                    } catch (IOException) {
+                                                        retries--;
+                                                    }
+                                                }
+
+                                                if (!extracted) {
+                                                    EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Archive Extraction Failed or Timeout: " + zipPath });
+                                                    return;
+                                                }
 
                                                 foreach (string file in Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories)) {
                                                     try {
@@ -641,16 +724,14 @@ public class RealTimeDataSensor {
                                                             string fileName = Path.GetFileName(file);
                                                             string hash;
                                                             using (var sha = System.Security.Cryptography.SHA256.Create()) {
-                                                                hash = BitConverter.ToString(sha.ComputeHash(buffer)).Replace("-","").Substring(0,8).ToLowerInvariant();
+                                                                hash = BitConverter.ToString(sha.ComputeHash(buffer)).Replace("-", "").Substring(0, 8).ToLowerInvariant();
                                                             }
                                                             string evName = $"{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{hash}_{fileName}";
                                                             string evPath = Path.Combine(evDir, evName);
 
                                                             File.Copy(file, evPath, true);
 
-                                                            resJson = resJson.Replace(
-                                                                JsonEscape(file),
-                                                                JsonEscape(evPath));
+                                                            resJson = resJson.Replace(JsonEscape(file), JsonEscape(evPath));
 
                                                             EventQueue.Enqueue(new DataEvent { EventType = "DLP_ALERT", ProcessName = "Archive_Extractor", UserName = "System", RawJson = resJson });
                                                             Interlocked.Increment(ref _eventQueueCount);
@@ -659,10 +740,11 @@ public class RealTimeDataSensor {
                                                     } catch { }
                                                 }
 
-                                                Directory.Delete(tempDir, true);
-                                                File.Delete(zipPath);
                                             } catch (Exception ex) {
-                                                EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Archive Extraction Failed: " + ex.Message });
+                                                EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Archive Extraction Exception: " + ex.Message });
+                                            } finally {
+                                                try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); } catch { }
+                                                try { if (File.Exists(zipPath)) File.Delete(zipPath); } catch { }
                                             }
                                         });
                                     }
@@ -787,40 +869,53 @@ public class RealTimeDataSensor {
 
     private static void StartBatchProcessor() {
         Task.Run(() => {
-            List<FfiPlatformEvent> batch = new List<FfiPlatformEvent>(5000);
+            var batchMap = new Dictionary<string, FfiPlatformEvent>(5000);
+
             while (!_cts.Token.IsCancellationRequested) {
                 try {
-                    foreach (var item in _uebaQueue.GetConsumingEnumerable(_cts.Token)) {
-                        batch.Add(item);
+                    if (_uebaQueue.TryTake(out FfiPlatformEvent firstItem, 1000, _cts.Token)) {
+                        string firstKey = $"{firstItem.event_type}|{firstItem.process}|{firstItem.destination}";
+                        batchMap[firstKey] = firstItem;
 
-                        while (batch.Count < 5000 && _uebaQueue.TryTake(out FfiPlatformEvent nextItem)) {
-                            batch.Add(nextItem);
+                        while (batchMap.Count < 5000 && _uebaQueue.TryTake(out FfiPlatformEvent nextItem)) {
+                            string key = $"{nextItem.event_type}|{nextItem.process}|{nextItem.destination}";
+
+                            if (batchMap.TryGetValue(key, out var existing)) {
+                                // Squash identical events together to reduce FFI overhead
+                                existing.bytes += nextItem.bytes;
+                                existing.duration_ms += nextItem.duration_ms;
+                                existing.is_dlp_hit = existing.is_dlp_hit || nextItem.is_dlp_hit;
+                                existing.timestamp = nextItem.timestamp;
+                                batchMap[key] = existing;
+                            } else {
+                                batchMap[key] = nextItem;
+                            }
                         }
 
-                        if (batch.Count > 0 && _mlEnginePtr != IntPtr.Zero) {
-                            System.Text.StringBuilder sb = new System.Text.StringBuilder(batch.Count * 256);
+                        if (batchMap.Count > 0 && _mlEnginePtr != IntPtr.Zero) {
+                            System.Text.StringBuilder sb = new System.Text.StringBuilder(batchMap.Count * 256);
                             sb.Append("[");
-                            for (int i = 0; i < batch.Count; i++) {
-                                var e = batch[i];
+
+                            int count = 0;
+                            foreach (var e in batchMap.Values) {
                                 string safePath = JsonEscape(e.filepath);
                                 string safeDest = JsonEscape(e.destination);
                                 sb.Append($"{{\"event_type\":\"{JsonEscape(e.event_type ?? "")}\",\"action\":\"{JsonEscape(e.action ?? "")}\",\"timestamp\":\"{JsonEscape(e.timestamp)}\",\"user\":\"{JsonEscape(e.user)}\",\"process\":\"{JsonEscape(e.process)}\",\"parent_process\":\"{JsonEscape(e.parent_process ?? "")}\",\"command_line\":\"{JsonEscape(e.command_line ?? "")}\",\"filepath\":\"{safePath}\",\"destination\":\"{safeDest}\",\"dest_port\":\"{JsonEscape(e.dest_port ?? "")}\",\"bytes\":{e.bytes},\"duration_ms\":{e.duration_ms},\"is_dlp_hit\":{(e.is_dlp_hit ? "true" : "false")}}}");
-                                if (i < batch.Count - 1) sb.Append(",");
+                                if (count < batchMap.Count - 1) sb.Append(",");
+                                count++;
                             }
                             sb.Append("]");
 
                             IntPtr resultPtr = process_telemetry_batch(_mlEnginePtr, sb.ToString());
                             ParseResponse(resultPtr, "UEBA_Engine", "System_ML", 0, "UEBA_ALERT");
-                            batch.Clear();
+                            batchMap.Clear();
                         }
                     }
-                    break;
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) {
                     EventQueue.Enqueue(new DataEvent { EventType = "ERROR", RawJson = "Batch Processor Fault: " + ex.Message });
-                    batch.Clear();
-                    // Do not break — transient faults should retry.
+                    batchMap.Clear();
                 }
             }
             _batchProcessorDone.Set();
@@ -900,8 +995,8 @@ public class RealTimeDataSensor {
                                     }
 
                                     if (!_uebaQueue.IsAddingCompleted) {
-                                        _uebaQueue.TryAdd(evt, 0);
-                                        if (_enableUniversalLedger) { _uebaJsonQueue.TryAdd(evt, 0); }
+                                        _uebaQueue.TryAdd(evt, 50);
+                                        if (_enableUniversalLedger) { _uebaJsonQueue.TryAdd(evt, 50); }
                                     }
                                 }
                             }

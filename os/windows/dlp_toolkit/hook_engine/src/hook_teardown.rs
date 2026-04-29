@@ -78,24 +78,34 @@ pub fn is_teardown_requested() -> bool {
 
 #[inline(always)]
 pub fn enter_hook() -> bool {
-    if TEARDOWN_REQUESTED.load(Ordering::Relaxed) {
+    let is_reentrant = HOOK_DEPTH.with(|depth| {
+        if depth.get() > 0 {
+            true
+        } else {
+            depth.set(1);
+            false
+        }
+    });
+
+    if is_reentrant {
         return false;
     }
 
-    HOOK_DEPTH.with(|depth| {
-        if depth.get() > 0 {
-            return false;
-        }
-        depth.set(1);
-        IN_FLIGHT_THREADS.fetch_add(1, Ordering::SeqCst);
-        true
-    })
+    IN_FLIGHT_THREADS.fetch_add(1, Ordering::SeqCst);
+
+    if TEARDOWN_REQUESTED.load(Ordering::SeqCst) {
+        IN_FLIGHT_THREADS.fetch_sub(1, Ordering::SeqCst);
+        HOOK_DEPTH.with(|depth| depth.set(0));
+        return false;
+    }
+
+    true
 }
 
 #[inline(always)]
 pub fn exit_hook() {
-    HOOK_DEPTH.with(|depth| depth.set(0));
     IN_FLIGHT_THREADS.fetch_sub(1, Ordering::SeqCst);
+    HOOK_DEPTH.with(|depth| depth.set(0));
 }
 
 pub struct HookGuard;

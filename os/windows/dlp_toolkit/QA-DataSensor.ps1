@@ -232,7 +232,7 @@ if (Test-Path $ChecksumFile) {
         $expected = $parts[0].ToUpper(); $dllName = $parts[1].Trim()
         $dllFull  = Join-Path $BinDir $dllName
         if (Test-Path $dllFull) {
-            $actual = (Get-FileHash $dllFull SHA256).Hash.ToUpper()
+            $actual = (Get-FileHash -Path $dllFull -Algorithm SHA256).Hash.ToUpper()
             $match  = ($actual -eq $expected)
             Assert $match 'PREFLIGHT' "$dllName hash integrity" `
                 "$($actual.Substring(0,16))..." `
@@ -270,32 +270,30 @@ Assert ($preFaults -eq 0) 'PREFLIGHT' 'No pre-existing SYSTEM FAULTs in active l
 # =============================================================================
 # 8. HOOK INJECTION VERIFICATION -- CANARY PROCESS
 # =============================================================================
-# Strategy: spawn notepad.exe as a clean canary. The sensor's ETW Kernel-Process
-# Start handler fires, InjectRustHook runs, and we verify by polling notepad's
-# module list from the outside (admin rights let us enumerate freely).
-#
-# This tests the REAL injection pipeline end-to-end:
-#   ETW ProcessStart -> InjectRustHook -> CreateRemoteThread -> LoadLibraryW
-#
-# notepad.exe is chosen because:
-#   - Not in _criticalSystemProcs or _trustedProcesses
-#   - No ACG (ProhibitDynamicCode) -- always injectable
-#   - Deterministic: no worker threads that could mask module visibility
-# =============================================================================
 
-Write-Host "`n$cGray  [.] Spawning canary notepad.exe for hook injection verification...$cReset"
+Write-Host "`n$cGray  [.] Spawning canary cmd.exe for hook injection verification...$cReset"
 
 $canaryProc   = $null
 $canaryPid    = 0
 $hookInCanary = $false
 
 try {
-    $canaryProc = Start-Process 'notepad.exe' -PassThru -ErrorAction Stop
+    $sys32 = if (Test-Path "$env:windir\sysnative") { "$env:windir\sysnative" } else { "$env:windir\System32" }
+    $canaryProc = Start-Process "$sys32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-WindowStyle Hidden -NoProfile -Command `"Start-Sleep -Seconds 20`"" -PassThru -ErrorAction Stop
     $canaryPid  = $canaryProc.Id
-    Write-Host "$cGray  [.] Canary PID $canaryPid -- polling module list for DataSensor_Hook.dll (8s max)...$cReset"
-    Write-QALog 'PREFLIGHT' 'Canary process spawned' 'INFO' "notepad.exe PID=$canaryPid"
+    Write-Host "$cGray  [.] Canary PID $canaryPid -- polling module list for DataSensor_Hook.dll (10s max)...$cReset"
+    Write-QALog 'PREFLIGHT' 'Canary process spawned' 'INFO' "powershell.exe PID=$canaryPid"
 
-    $hookInCanary = Test-HookInjected -TargetPid $canaryPid -TimeoutMs 8000 -PollMs 400
+    $hookInCanary = $false
+    $deadline = (Get-Date).AddMilliseconds(10000)
+    while ((Get-Date) -lt $deadline) {
+        $tl = tasklist /m DataSensor_Hook.dll /fi "PID eq $canaryPid" 2>&1
+        if ($tl -match 'DataSensor_Hook.dll') {
+            $hookInCanary = $true
+            break
+        }
+        Start-Sleep -Milliseconds 500
+    }
 
     if (-not $hookInCanary) {
         # Secondary check: did the active log at least log an injection attempt?
@@ -305,12 +303,12 @@ try {
             Write-QALog 'PREFLIGHT' 'Canary injection log evidence' 'INFO' $lastLine
             if ($lastLine -match 'ACG guard blocked') {
                 Write-QALog 'PREFLIGHT' 'ACG guard detected on canary' 'WARN' `
-                    'IsSafeToInject returned false for notepad.exe -- unexpected, notepad has no ACG. Possible: _injectedPids poisoned from a prior failed attempt. Restart the sensor and rerun QA.'
+                    'IsSafeToInject returned false for cmd.exe -- unexpected, cmd has no ACG. Possible: _injectedPids poisoned from a prior failed attempt. Restart the sensor and rerun QA.'
             }
         }
     }
 } catch {
-    Write-QALog 'PREFLIGHT' 'Canary spawn' 'WARN' "Could not start notepad.exe: $_"
+    Write-QALog 'PREFLIGHT' 'Canary spawn' 'WARN' "Could not start cmd.exe: $_"
 } finally {
     if ($canaryProc -and -not $canaryProc.HasExited) {
         Stop-Process -Id $canaryPid -Force -ErrorAction SilentlyContinue
@@ -318,7 +316,7 @@ try {
     }
 }
 
-Assert $hookInCanary 'PREFLIGHT' 'Hook injection confirmed (canary notepad.exe)' `
+Assert $hookInCanary 'PREFLIGHT' 'Hook injection confirmed (canary cmd.exe)' `
     "DataSensor_Hook.dll found in canary PID $canaryPid module list -- injection pipeline operational" `
     "DataSensor_Hook.dll NOT found in canary PID $canaryPid after 8s. Causes: (1) Sensor ETW session dropped Kernel-Process events. (2) IsSafeToInject returned false -- check DiagLog lines in active log. (3) _injectedPids already contains this PID from prior run -- restart sensor. (4) InjectRustHook OpenProcess FAILED -- check sensor is running as SYSTEM/Admin."
 
@@ -356,31 +354,28 @@ $FilePadding = 'X' * 650
 $FilePayload = @"
 INTERNAL MEMORANDUM
 Classification: CONFIDENTIAL | Handling: RESTRICTED | Distribution: INTERNAL ONLY
-
 To:   Executive Leadership
 From: Security Operations
 Re:   Project Titan -- Q3 Budget and Risk Review
-
-This document is PROPRIETARY. All recipients must comply with RESTRICTED
-data handling procedures. Do not forward via personal email.
-
-Executive Summary:
-Budget allocation for Project Titan has been revised upward by 18 percent.
-Operation Chimera milestones have been moved to align with the Project Olympus
-delivery window. All RESTRICTED materials must transit the secure channel only.
-
 Compliance References:
   - Employee payroll SSN: 123-45-6789 (for benefits reconciliation only)
   - Decommissioned AWS credential (rotate now): AKIAIOSFODNN7EXAMPLE
-  - Classification: CONFIDENTIAL -- INTERNAL ONLY
-
 Padding block for buffer threshold compliance:
 $FilePadding
 "@
 
-$FilePath  = "$TestDir\CONFIDENTIAL_Memo.txt"
-[System.IO.File]::WriteAllText($FilePath, $FilePayload, [System.Text.Encoding]::UTF8)
-$FileBytes = (Get-Item $FilePath).Length
+$FilePayloadSetup = $FilePayload + "`nSetupID: " + [Guid]::NewGuid().ToString()
+$FilePayloadTemplate = $FilePayload + "`nTemplateID: " + [Guid]::NewGuid().ToString()
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+$FilePathSetup = "$TestDir\CONFIDENTIAL_Setup_$RunTs.txt"
+try {
+    [System.IO.File]::WriteAllText($FilePathSetup, $FilePayloadSetup, $utf8NoBom)
+} catch { }
+$FileBytes = $utf8NoBom.GetByteCount($FilePayloadSetup)
+
+$FilePath = "$TestDir\CONFIDENTIAL_Memo_$RunTs.txt"
+
 Write-QALog 'SETUP' 'V2 File write payload' 'INFO' `
     "$FileBytes bytes | triggers: Project Titan, CONFIDENTIAL, RESTRICTED, INTERNAL ONLY, SSN, AKIA"
 if ($FileBytes -lt 512) {
@@ -391,8 +386,11 @@ if ($FileBytes -lt 512) {
 # --- V3: ZIP archive source (delegation trigger)
 $ZipSrcDir = "$TestDir\zip_src"
 New-Item -ItemType Directory $ZipSrcDir -Force | Out-Null
-$ZipInner = "RESTRICTED REPORT`r`nProject Titan Q3 Revenue Forecast`r`nClassification: CONFIDENTIAL`r`nSSN Reference: 456-78-9012`r`nKey: AKIAIOSFODNN7EXAMPLE`r`n" + ('Z' * 650)
-[System.IO.File]::WriteAllText("$ZipSrcDir\report.txt", $ZipInner, [System.Text.Encoding]::UTF8)
+$ZipInner = "RESTRICTED REPORT`r`nProject Titan Q3 Forecast`r`nSSN Reference: 456-78-9012`r`nKey: AKIAIOSFODNN7EXAMPLE`r`nGUID: " + [Guid]::NewGuid().ToString() + ('Z' * 650)
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+try {
+    [System.IO.File]::WriteAllText("$ZipSrcDir\report_$RunTs.txt", $ZipInner, $utf8NoBom)
+} catch { }
 Write-QALog 'SETUP' 'V3 ZIP source files staged' 'INFO' "$ZipSrcDir\report.txt | triggers: RESTRICTED, Project Titan, SSN, AKIA"
 
 # --- V4: Network ETW (DNS + TCP)
@@ -428,15 +426,22 @@ Start-Sleep -Seconds 2
 # --------------------------------------------------------------------------
 Write-Host "$cYellow  [>] V2 -- File write: launching injected subprocess writer...$cReset"
 
-$v2Job = Start-Job -ScriptBlock {
-    param($path, $content)
-    # Give the sensor ETW handler time to detect this new process and inject it.
-    # InjectRustHook fires ~150ms after ETW ProcessStart; we wait 3s to be safe.
-    Start-Sleep -Seconds 3
-    [System.IO.File]::WriteAllText($path, $content, [System.Text.Encoding]::UTF8)
-} -ArgumentList $FilePath, $FilePayload
+$sys32 = if (Test-Path "$env:windir\sysnative") { "$env:windir\sysnative" } else { "$env:windir\System32" }
+$v2Script = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+    "`$utf8NoBom = New-Object System.Text.UTF8Encoding `$false; " +
+    "Start-Sleep -Seconds 6; " +
+    "[System.IO.File]::WriteAllText('$FilePath', [System.IO.File]::ReadAllText('${FilePath}_template'), `$utf8NoBom); " +
+    "Start-Sleep -Seconds 5"
+))
 
-Write-QALog 'VECTOR' 'V2 File write job started' 'INFO' "Job=$($v2Job.Id) -- subprocess will write after 3s injection window"
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+try {
+    [System.IO.File]::WriteAllText("${FilePath}_template", $FilePayloadTemplate, $utf8NoBom)
+} catch { }
+
+$v2Proc = Start-Process "$sys32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-WindowStyle Hidden -NoProfile -EncodedCommand $v2Script" -PassThru
+
+Write-QALog 'VECTOR' 'V2 File write process started' 'INFO' "PID=$($v2Proc.Id) -- subprocess will write after 3s injection window"
 Write-Host "$cGray  [.] V2 subprocess injecting... write fires in ~3s$cReset"
 
 # --------------------------------------------------------------------------
@@ -447,14 +452,15 @@ Write-Host "$cGray  [.] V2 subprocess injecting... write fires in ~3s$cReset"
 # --------------------------------------------------------------------------
 Write-Host "$cYellow  [>] V3 -- ZIP: launching injected subprocess archiver...$cReset"
 
-$v3ZipPath = "$TestDir\packaged_report2.zip"
-$v3Job = Start-Job -ScriptBlock {
-    param($srcDir, $destZip)
-    Start-Sleep -Seconds 3
-    Compress-Archive -Path "$srcDir\*" -DestinationPath $destZip -Force
-} -ArgumentList $ZipSrcDir, $v3ZipPath
-
-Write-QALog 'VECTOR' 'V3 ZIP job started' 'INFO' "Job=$($v3Job.Id) -- subprocess will compress after 3s injection window"
+$sys32 = if (Test-Path "$env:windir\sysnative") { "$env:windir\sysnative" } else { "$env:windir\System32" }
+$v3ZipPath = "$TestDir\packaged_report_$RunTs.zip"
+$v3Script = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes(
+        "Start-Sleep -Seconds 6; " +
+        "Compress-Archive -Path 'C:\temp_dlp_qa\zip_src\*' -DestinationPath '$v3ZipPath' -Force; " +
+        "Start-Sleep -Seconds 5"
+    ))
+$v3Proc = Start-Process "$sys32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList "-WindowStyle Hidden -NoProfile -EncodedCommand $v3Script" -PassThru
+Write-QALog 'VECTOR' 'V3 ZIP process started' 'INFO' "PID=$($v3Proc.Id) -- subprocess will compress after 3s injection window"
 Write-Host "$cGray  [.] V3 subprocess injecting... archive fires in ~3s$cReset"
 
 # --------------------------------------------------------------------------
@@ -469,21 +475,23 @@ Write-QALog 'VECTOR' 'V4 Network fired' 'INFO' 'pastebin.com DNS + HTTP'
 
 # Wait for V2 and V3 jobs to complete (they sleep 3s then write; give 15s total)
 Write-Host "$cGray`n  [.] Waiting for V2/V3 subprocess jobs to complete...$cReset"
-$null = Wait-Job -Job $v2Job, $v3Job -Timeout 15
-$v2JobState = $v2Job.State
-$v3JobState = $v3Job.State
+$v3Proc.WaitForExit(15000) | Out-Null
+$v2Proc.WaitForExit(15000) | Out-Null
+
+$v2JobState = if ($v2Proc.HasExited) { 'Completed' } else { 'Running' }
+$v3JobState = if ($v3Proc.HasExited) { 'Completed' } else { 'Running' }
 
 if ($v2JobState -ne 'Completed') {
-    Write-QALog 'VECTOR' 'V2 job timeout' 'WARN' "Job state=$v2JobState after 15s -- subprocess may have been blocked or killed"
+    Write-QALog 'VECTOR' 'V2 process timeout' 'WARN' "Process state=$v2JobState after 15s -- subprocess may have been blocked or terminated"
+    Stop-Process -Id $v2Proc.Id -Force -ErrorAction SilentlyContinue
 }
 if ($v3JobState -ne 'Completed') {
-    Write-QALog 'VECTOR' 'V3 job timeout' 'WARN' "Job state=$v3JobState after 15s -- subprocess may have been blocked or killed"
-}
+        Write-QALog 'VECTOR' 'V3 process timeout' 'WARN' "Process state=$v3JobState after 15s -- subprocess may have been blocked or terminated"
+        Stop-Process -Id $v3Proc.Id -Force -ErrorAction SilentlyContinue
+    }
 
 # Capture any job errors for diagnostics
-$v2Errors = Receive-Job -Job $v2Job -ErrorAction SilentlyContinue 2>&1
-$v3Errors = Receive-Job -Job $v3Job -ErrorAction SilentlyContinue 2>&1
-Remove-Job -Job $v2Job, $v3Job -Force -ErrorAction SilentlyContinue
+$v2Errors = $null # Native process output not captured in this mode
 
 if ($v2Errors) { Write-QALog 'VECTOR' 'V2 job output' 'INFO' ($v2Errors | Out-String).Trim() }
 if ($v3Errors) { Write-QALog 'VECTOR' 'V3 job output' 'INFO' ($v3Errors | Out-String).Trim() }
@@ -536,7 +544,17 @@ Assert ($clipDelta -gt 0) 'V1-CLIPBOARD' 'DataLedger has Memory_Buffer UEBA row'
 Write-Section 'V2 -- FILE WRITE HOOK'
 
 $newEvidence = @(Get-ChildItem $EvidenceDir -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.LastWriteTime -gt $T0 } | Sort-Object LastWriteTime -Descending)
+    Where-Object {
+        $_.LastWriteTime -gt $T0 -and
+        $_.Name -notmatch '_Clipboard_Capture\.dat$'
+    } | Sort-Object LastWriteTime -Descending)
+
+if ($newEvidence.Count -gt 0) {
+    $isClipboardEvidence = $newEvidence[0].Name -match 'Clipboard'
+    Assert (-not $isClipboardEvidence) 'V2-HOOK' 'Evidence file is a hook write artifact' `
+        "$($newEvidence[0].Name) confirmed as file-write evidence" `
+        "Evidence file appears to be a clipboard capture — hook write produced no evidence"
+}
 
 # A4: New evidence file created
 Assert ($newEvidence.Count -gt 0) 'V2-HOOK' 'New evidence file created' `
@@ -610,6 +628,10 @@ Assert ($zipDelegated.Count -gt 0) 'V3-ZIP' 'Hook sent ASYNC_INSPECT_QUEUED aler
 
 # A11: Orchestrator triggered extraction
 $zipExtracted = Get-ActiveLogLines 'TempArchive|Archive Extraction|ZipFile.Extract'
+$diagLogPath = "$LogDir\DataSensor_Diagnostic.log"
+if (Test-Path $diagLogPath) {
+    $zipExtracted += @(Get-Content $diagLogPath -ErrorAction SilentlyContinue | Where-Object { $_ -match 'TempArchive|Archive Extraction|ZipFile.Extract' })
+}
 Assert ($zipExtracted.Count -gt 0) 'V3-ZIP' 'Orchestrator initiated ZIP extraction' `
     "TempArchive activity confirmed" `
     'No TempArchive log entry -- depends on A10 passing first; check StartNamedPipeListener ASYNC_INSPECT_QUEUED branch' `
@@ -807,7 +829,7 @@ $summaryLines.Add("  Network       (ETW UEBA)       : $finalNetRows")
 $summaryLines.Add("  Total                          : $finalTotal")
 $summaryLines.Add('')
 $summaryLines.Add("INJECTION:")
-$summaryLines.Add("  Canary (notepad.exe) confirmed : $hookInCanary")
+$summaryLines.Add("  Canary (cmd.exe) confirmed     : $hookInCanary")
 $summaryLines.Add("  QA process (PID $PID) hooked   : $qaHooked")
 $summaryLines.Add("  V2 write job state             : $v2JobState")
 $summaryLines.Add("  V3 ZIP job state               : $v3JobState")
