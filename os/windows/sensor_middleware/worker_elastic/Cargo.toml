@@ -1,0 +1,13 @@
+[package]
+name = "worker_elastic"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+lib_siem_template = { path = "../lib_siem_template" }
+rust-ini = "0.21"
+reqwest = { version = "0.11", features = ["rustls-tls"], default-features = false }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

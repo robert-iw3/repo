@@ -65,6 +65,50 @@ Run the orchestrator from an elevated terminal using one of the following operat
 | **Test** | `.\IDPSSensor_Launcher.ps1 -TestMode` | Bypasses common CDN IP exclusions for validation testing. |
 | **Verbose** | `.\IDPSSensor_Launcher.ps1 -EnableDiagnostics` | Enables detailed logging of FFI transitions and ETW events. |
 
+#### Optional: Launch the Sensor with a Stealth Footprint
+```powershell
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Warning "Deployment halted. Administrator privileges are required to configure Session 0 and Symbolic Links."
+    return
+}
+
+$UsePwshCore = $true  # Toggle to $false for Windows PowerShell 5.1
+$TaskName    = "WinTelemetryCache"
+$IDPSRoot    = "C:\ProgramData\IDPSSensor"
+$BinDir      = "$IDPSRoot\Bin"
+$SensorPath  = "C:\Path\to\IDPSSensor_Launcher.ps1" # correct the path
+$StealthExe  = "$BinDir\vmmem_svc.exe" # rename here
+
+if (!(Test-Path $BinDir)) { New-Item $BinDir -ItemType Directory -Force | Out-Null }
+
+$rootItem = Get-Item $IDPSRoot
+$rootItem.Attributes = $rootItem.Attributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System
+
+if ($UsePwshCore) {
+    $RealExe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+    if (!$RealExe) { throw "PowerShell 7+ (pwsh.exe) not found on host." }
+} else {
+    $RealExe = "$env:Windir\System32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+if (Test-Path $StealthExe) { Remove-Item $StealthExe -Force }
+New-Item -ItemType SymbolicLink -Path $StealthExe -Target $RealExe | Out-Null
+
+$Action = New-ScheduledTaskAction -Execute $StealthExe `
+    -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$SensorPath`" -ArmedMode" # configure runtime param switches
+
+$Trigger = New-ScheduledTaskTrigger -AtStartup
+$Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings
+
+Write-Host "[+] Deployment Complete: Sensor active in Session 0 as '$TaskName'." -ForegroundColor Green
+```
+
 #### 5. Observability & Monitoring
 * **Terminal Dashboard**: Provides real-time metrics on events processed, active flows, and engine health.
 * **Live Browser HUD**: A local web interface (automatically launched) provides an interactive workbench to inspect structured JSONL alerts and UEBA baseline logs.
