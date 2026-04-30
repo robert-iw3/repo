@@ -1,28 +1,16 @@
-/*=============================================================================================
- * SYSTEM:          Universal Telemetry Gateway - Transmission Layer
- * COMPONENT:       lib.rs (Async Network Pusher)
- * DESCRIPTION:
- * Asynchronously tails sensor telemetry and pushes micro-batched data to the
- * designated middleware gateway.
- *============================================================================================*/
-
 use ini::Ini;
 use reqwest::{Client, StatusCode, header};
 use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
-use lru::LruCache;
-use std::num::NonZeroUsize;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::HashSet;
 
 pub struct TransmissionConfig {
     pub enable_sync: bool,
     pub endpoint: String,
     pub auth_token: String,
     pub sensor_type: String,
-    pub batch_interval_ms: u64,
     pub max_batch_size: usize,
     pub max_retries: u32,
     pub base_retry_delay_ms: u64,
@@ -37,8 +25,7 @@ impl TransmissionConfig {
             enable_sync: section.and_then(|s| s.get("EnableSync")).unwrap_or("False").eq_ignore_ascii_case("true"),
             endpoint: section.and_then(|s| s.get("MiddlewareEndpoint")).unwrap_or("").to_string(),
             auth_token: section.and_then(|s| s.get("AuthToken")).unwrap_or("").to_string(),
-            sensor_type: section.and_then(|s| s.get("SensorType")).unwrap_or("unknown").to_string(),
-            batch_interval_ms: section.and_then(|s| s.get("BatchIntervalMs")).and_then(|v| v.parse().ok()).unwrap_or(500),
+            sensor_type: section.and_then(|s| s.get("SensorType")).unwrap_or("deepsensor").to_string(),
             max_batch_size: section.and_then(|s| s.get("MaxBatchSize")).and_then(|v| v.parse().ok()).unwrap_or(1000),
             max_retries: section.and_then(|s| s.get("MaxRetries")).and_then(|v| v.parse().ok()).unwrap_or(5),
             base_retry_delay_ms: section.and_then(|s| s.get("BaseRetryDelayMs")).and_then(|v| v.parse().ok()).unwrap_or(1000),
@@ -47,8 +34,18 @@ impl TransmissionConfig {
 }
 
 fn generate_transmission_key(val: &Value) -> String {
-    let process = val.get("Process").or_else(|| val.get("process")).or_else(|| val.get("Image")).and_then(|v| v.as_str()).unwrap_or("Unknown");
-    let signature = val.get("SignatureName").or_else(|| val.get("reason")).or_else(|| val.get("MatchedIndicator")).or_else(|| val.get("action")).and_then(|v| v.as_str()).unwrap_or("Unknown");
+    let process = val.get("Process")
+        .or_else(|| val.get("process"))
+        .or_else(|| val.get("Image"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+
+    let signature = val.get("SignatureName")
+        .or_else(|| val.get("reason"))
+        .or_else(|| val.get("MatchedIndicator"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+
     let score = val.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let category = val.get("Category").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -74,12 +71,15 @@ pub async fn start_transmission_worker(
         return;
     }
 
-    let mut dedup_matrix = LruCache::new(NonZeroUsize::new(50_000).unwrap());
+    let mut historical_transmissions = HashSet::new();
+    // Prevent infinite memory growth: clear the hashset if it exceeds 50,000 unique signatures
+    const MAX_TRACKED_SIGNATURES: usize = 50_000;
 
     let mut headers = header::HeaderMap::new();
     headers.insert("Authorization", header::HeaderValue::from_str(&format!("Bearer {}", config.auth_token)).unwrap());
     headers.insert("X-Sensor-Type", header::HeaderValue::from_str(&config.sensor_type).unwrap());
 
+    // Increased timeout to allow for slower enterprise network routes
     let client = Client::builder()
         .use_rustls_tls()
         .default_headers(headers)
@@ -92,47 +92,37 @@ pub async fn start_transmission_worker(
     loop {
         let mut batch: Vec<Value> = Vec::with_capacity(config.max_batch_size);
 
-        // Idle at 0% CPU until at least ONE event arrives
         if let Some(first) = rx.recv().await {
-            let key = generate_transmission_key(&first);
-            if !dedup_matrix.contains(&key) {
-                dedup_matrix.put(key, ());
-                batch.push(first);
+
+            // Memory Management for the Gatekeeper
+            if historical_transmissions.len() > MAX_TRACKED_SIGNATURES {
+                log_diag("[Transmission] Clearing deduplication matrix to preserve memory limits.");
+                historical_transmissions.clear();
             }
 
-            let timeout = sleep(Duration::from_millis(config.batch_interval_ms));
-            tokio::pin!(timeout);
+            let key = generate_transmission_key(&first);
+            if historical_transmissions.insert(key) { batch.push(first); }
 
-            loop {
-                if batch.len() >= config.max_batch_size { break; }
-
-                tokio::select! {
-                    _ = &mut timeout => {
-                        break; // 500ms window expired, flush the batch
-                    }
-                    msg_opt = rx.recv() => {
-                        match msg_opt {
-                            Some(next) => {
-                                let key = generate_transmission_key(&next);
-                                if !dedup_matrix.contains(&key) {
-                                    dedup_matrix.put(key, ());
-                                    batch.push(next);
-                                }
-                            }
-                            None => return, // Channel closed
-                        }
-                    }
+            while batch.len() < config.max_batch_size {
+                if let Ok(next) = rx.try_recv() {
+                    let key = generate_transmission_key(&next);
+                    if historical_transmissions.insert(key) { batch.push(next); }
+                } else {
+                    break;
                 }
             }
 
             if batch.is_empty() { continue; }
 
-            // 3. AUTO-RECOVERY LOGIC
+            // =================================================================
+            // AUTO-RECOVERY & THROTTLING LOGIC (Exponential Backoff)
+            // =================================================================
             let mut retry_count = 0;
-            let mut base_delay_ms = config.base_retry_delay_ms;
+            let max_retries = 5;
+            let mut base_delay_ms = 1000;
             let mut transmission_success = false;
 
-            while retry_count <= config.max_retries {
+            while retry_count <= max_retries {
                 match client.post(&config.endpoint).json(&batch).send().await {
                     Ok(resp) => {
                         let status = resp.status();
@@ -140,42 +130,35 @@ pub async fn start_transmission_worker(
                             transmission_success = true;
                             break;
                         } else if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                            log_diag(&format!("[Transmission] Middleware requested backoff (HTTP {}). Retrying {}/{}...", status, retry_count + 1, config.max_retries));
+                            // HTTP 429 or 5xx: Middleware is telling us to back off
+                            log_diag(&format!("[Transmission] Middleware requested backoff (HTTP {}). Retrying {}/{}...", status, retry_count + 1, max_retries));
                         } else {
-                            log_diag(&format!("[Transmission] Fatal rejection by Middleware (HTTP {}). Dropping batch.", status));
+                            // HTTP 4xx (e.g., 401 Unauthorized, 403 Forbidden, 400 Bad Request)
+                            // Retrying will not fix a bad token or malformed JSON. Drop batch.
+                            log_diag(&format!("[Transmission] Fatal rejection by Middleware (HTTP {}). Dropping batch of {} events.", status, batch.len()));
                             break;
                         }
                     }
                     Err(e) => {
-                        log_diag(&format!("[Transmission] Network fault: {}. Retrying {}/{}...", e, retry_count + 1, config.max_retries));
+                        // Network/DNS failure or Timeout
+                        log_diag(&format!("[Transmission] Network fault: {}. Retrying {}/{}...", e, retry_count + 1, max_retries));
                     }
                 }
 
                 retry_count += 1;
-                if retry_count <= config.max_retries {
+                if retry_count <= max_retries {
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
                     sleep(Duration::from_millis(base_delay_ms)).await;
                     base_delay_ms *= 2;
                 }
             }
 
             if !transmission_success {
-                log_diag(&format!("[Transmission] CRITICAL: Exhausted all retries. Spooling {} events to DLQ.", batch.len()));
-
-                // Spool to disk so the SIEM team can recover it later
-                let dlq_path = if config.sensor_type == "deepsensor" {
-                    r"C:\ProgramData\DeepSensor\Logs\Transmission_DLQ.jsonl"
-                } else {
-                    r"C:\ProgramData\DataSensor\Logs\Transmission_DLQ.jsonl"
-                };
-
-                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(dlq_path) {
-                    for event in &batch {
-                        let _ = writeln!(file, "{}", serde_json::to_string(event).unwrap_or_default());
-                    }
-                }
+                log_diag(&format!("[Transmission] CRITICAL: Exhausted all retries. Dropped {} telemetry events.", batch.len()));
+                // Data Fidelity Failure Point: Events are dropped from the network pipeline here.
             }
         } else {
-            break; // Engine shutting down
+            break; // Channel closed, orchestrator shutting down
         }
     }
 }

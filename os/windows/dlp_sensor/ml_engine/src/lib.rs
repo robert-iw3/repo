@@ -128,7 +128,7 @@ pub struct DlpEngine {
     pub regex_set: RegexSet,
     pub patterns: Vec<String>,
     pub strict_set: std::collections::HashSet<String>,
-    pub tx: mpsc::Sender<transmission::TransmissionPayload>,
+    pub tx: mpsc::Sender<serde_json::Value>,
     pub rt: Runtime,
 }
 
@@ -325,15 +325,17 @@ pub extern "C" fn process_telemetry_batch(
             }
 
             // --- IN-MEMORY TRANSMISSION BRANCH ---
-            let payload = transmission::TransmissionPayload {
-                timestamp: ffi_evt.timestamp.clone(),
-                user: ffi_evt.user.clone(),
-                process: ffi_evt.process.clone(),
-                destination: ffi_evt.destination.clone(),
-                bytes: ffi_evt.bytes,
-                is_dlp_hit: ffi_evt.is_dlp_hit,
-                event_type: ffi_evt.event_type.clone(),
-            };
+            let payload = serde_json::json!({
+                "timestamp": ffi_evt.timestamp.clone(),
+                "user": ffi_evt.user.clone(),
+                "process": ffi_evt.process.clone(),
+                "destination": ffi_evt.destination.clone(),
+                "bytes": ffi_evt.bytes,
+                "is_dlp_hit": ffi_evt.is_dlp_hit,
+                "event_type": ffi_evt.event_type.clone(),
+                "action": ffi_evt.action.clone(),
+                "filepath": ffi_evt.filepath.clone()
+            });
 
             let _ = engine.tx.try_send(payload);
 
@@ -409,6 +411,13 @@ pub extern "C" fn process_telemetry_batch(
         return make_error_response(&format!("SQL Commit Error: {}", e));
     }
 
+    // --- UNIVERSAL GATEWAY DISPATCH ---
+    for alert in &alerts {
+        if let Ok(json_val) = serde_json::to_value(alert) {
+            let _ = engine.tx.try_send(json_val);
+        }
+    }
+
     serialize_response(alerts)
 }
 
@@ -480,6 +489,12 @@ pub extern "C" fn scan_text_payload(
             filepath: Some(fp.to_string()),
             destination: Some(dest.to_string()),
         };
+
+        // --- UNIVERSAL GATEWAY DISPATCH ---
+        if let Ok(json_val) = serde_json::to_value(&alert) {
+            let _ = engine.tx.try_send(json_val);
+        }
+
         return serialize_response(vec![alert]);
     }
 

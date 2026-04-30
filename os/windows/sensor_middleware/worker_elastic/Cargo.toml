@@ -11,3 +11,4 @@ reqwest = { version = "0.11", features = ["rustls-tls"], default-features = fals
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+serde_json = "1.0"

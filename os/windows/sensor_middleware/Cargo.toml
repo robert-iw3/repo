@@ -3,7 +3,7 @@ members = [
     "core_ingress",
     "worker_elastic",
     "worker_splunk",
-    "lib_siem_template"
+    "worker_sql"
 ]
 resolver = "2"
 

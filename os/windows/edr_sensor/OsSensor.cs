@@ -43,12 +43,14 @@ public class DeepVisibilitySensor {
     [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern void teardown_engine(IntPtr engine);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
+
+    private static Dictionary<string, string> _deviceMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private static BlockingCollection<string> _mlWorkQueue = new BlockingCollection<string>(new ConcurrentQueue<string>(), 2000);
     private static CancellationTokenSource _mlCancelSource = new CancellationTokenSource();
     private static IntPtr _mlEnginePtr = IntPtr.Zero;
-
     private static Task _mlConsumerTask;
-
     public static int GetMlQueueDepth() => _mlWorkQueue.Count;
     public static int GetPowerShellQueueDepth() => EventQueue.Count;
 
@@ -90,6 +92,28 @@ public class DeepVisibilitySensor {
         Exact
     }
 
+    public static void InitializePathMap() {
+        try {
+            foreach (var drive in Environment.GetLogicalDrives()) {
+                string d = drive.Substring(0, 2); // Extract "C:"
+                StringBuilder sb = new StringBuilder(1024);
+                if (QueryDosDevice(d, sb, (uint)sb.Capacity) != 0) {
+                    _deviceMap[sb.ToString()] = d;
+                }
+            }
+        } catch { }
+    }
+
+    public static string ResolveDosPath(string ntPath) {
+        if (string.IsNullOrEmpty(ntPath)) return ntPath;
+        foreach (var kvp in _deviceMap) {
+            if (ntPath.StartsWith(kvp.Key, StringComparison.OrdinalIgnoreCase)) {
+                return kvp.Value + ntPath.Substring(kvp.Key.Length);
+            }
+        }
+        return ntPath;
+    }
+
     private static bool EvaluateMatch(string data, string trigger, MatchType matchType) {
         if (string.IsNullOrEmpty(data) || string.IsNullOrEmpty(trigger)) return false;
         return matchType switch {
@@ -115,10 +139,9 @@ public class DeepVisibilitySensor {
                 if (condition.Field.IndexOf("ParentImage", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("ParentCommandLine", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = parentImage; isFieldMapped = true; }
                 else if (condition.Field.IndexOf("ImageLoaded", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("Module", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = path; isFieldMapped = true; }
                 else if (condition.Field.IndexOf("Image", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("OriginalFileName", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = image; isFieldMapped = true; }
-                else if (condition.Field.IndexOf("CommandLine", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("Details", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = cmd; isFieldMapped = true; }
+                else if (condition.Field.IndexOf("CommandLine", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("Details", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("DestinationIp", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = cmd; isFieldMapped = true; }
                 else if (condition.Field.IndexOf("Registry", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("TargetObject", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = fullReg; isFieldMapped = true; }
-                else if (condition.Field.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("FileName", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = path; isFieldMapped = true; }
-
+                else if (condition.Field.IndexOf("TargetFilename", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("Target", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("FileName", StringComparison.OrdinalIgnoreCase) >= 0 || condition.Field.IndexOf("DestinationPort", StringComparison.OrdinalIgnoreCase) >= 0) { targetString = path; isFieldMapped = true; }
                 if (!isFieldMapped) {
                     continue; // Safely bypass unmapped fields (e.g., Hashes)
                 }
@@ -205,6 +228,7 @@ public class DeepVisibilitySensor {
         public HighFidelityTTPRule[] RegRules;
         public HighFidelityTTPRule[] ImgRules;
         public HighFidelityTTPRule[] WmiRules;
+        public HighFidelityTTPRule[] NetRules;
     }
 
     private static TtpRuleMatrix _ttpMatrix;
@@ -223,6 +247,7 @@ public class DeepVisibilitySensor {
         public string Technique;
         public string Procedure;
         public string Severity;
+        public string EventUser;
     }
 
     public static void SafeEnqueueEvent(string jsonPayload) {
@@ -261,7 +286,7 @@ public class DeepVisibilitySensor {
             }, _mlCancelSource.Token);
         }
 
-        public void AddEvent(string originalJson, string parent, string process, string type, string matchedIndicator, string cmd, string path, int tid, string sigName = "", string tactic = "", string tech = "", string proc = "", string sev = "") {
+        public void AddEvent(string originalJson, string parent, string process, string type, string matchedIndicator, string cmd, string path, int tid, string eventUser, string sigName = "", string tactic = "", string tech = "", string proc = "", string sev = "") {
             if (string.IsNullOrWhiteSpace(originalJson)) return;
 
             try {
@@ -283,7 +308,8 @@ public class DeepVisibilitySensor {
                     Tactic = tactic,
                     Technique = tech,
                     Procedure = proc,
-                    Severity = sev
+                    Severity = sev,
+                    EventUser = eventUser
                 });
 
                 bucket.Count++;
@@ -324,7 +350,12 @@ public class DeepVisibilitySensor {
                 ""Tactic"":""{JsonEscape(b.Tactic)}"",
                 ""Technique"":""{JsonEscape(b.Technique)}"",
                 ""Procedure"":""{JsonEscape(b.Procedure)}"",
-                ""Severity"":""{JsonEscape(b.Severity)}""
+                ""Severity"":""{JsonEscape(b.Severity)}"",
+                ""ComputerName"":""{HostComputerName}"",
+                ""IP"":""{HostIP}"",
+                ""OS"":""{HostOS}"",
+                ""SensorUser"":""{SensorUser}"",
+                ""EventUser"":""{JsonEscape(b.EventUser)}""
             }}".Replace("\r", "").Replace("\n", "").Replace("  ", "");
 
             if (_mlEnginePtr != IntPtr.Zero && !_mlWorkQueue.IsAddingCompleted)
@@ -708,6 +739,7 @@ public class DeepVisibilitySensor {
         public SigmaRule[] FileRules = Array.Empty<SigmaRule>();
         public SigmaRule[] RegRules  = Array.Empty<SigmaRule>();
         public SigmaRule[] WmiRules  = Array.Empty<SigmaRule>();
+        public SigmaRule[] NetRules  = Array.Empty<SigmaRule>();
     }
 
     private static RuleMatrix _activeMatrix = new RuleMatrix();
@@ -725,6 +757,7 @@ public class DeepVisibilitySensor {
             var fileList = new List<SigmaRule>();
             var regList = new List<SigmaRule>();
             var wmiList = new List<SigmaRule>();
+            var netList = new List<SigmaRule>();
 
             foreach (string r in rules) {
                 string[] parts = r.Split('|');
@@ -770,6 +803,7 @@ public class DeepVisibilitySensor {
                     case "registry_event":
                     case "registry_set": regList.Add(rule); break;
                     case "wmi_event": wmiList.Add(rule); break;
+                    case "network_connection": netList.Add(rule); break;
                 }
             }
 
@@ -778,6 +812,7 @@ public class DeepVisibilitySensor {
             matrix.FileRules = fileList.ToArray();
             matrix.RegRules = regList.ToArray();
             matrix.WmiRules = wmiList.ToArray();
+            matrix.NetRules = netList.ToArray();
 
             Interlocked.Exchange(ref _activeMatrix, matrix);
         } catch (Exception ex) {
@@ -899,7 +934,8 @@ public class DeepVisibilitySensor {
         string category, string eventType, string process, string parentProcess,
         int pid, int parentPid, int tid, string cmdline, string details,
         string path = "", string extraType = "", string matchedIndicator = "",
-        string signatureName = "", string severity = "", string tags = "")
+        string signatureName = "", string severity = "", string tags = "",
+        string destinationIp = "", int destPort = 0)
     {
 
         string procLower = process.ToLowerInvariant();
@@ -927,8 +963,8 @@ public class DeepVisibilitySensor {
             ""OS"":""{HostOS}"",
             ""SensorUser"":""{SensorUser}"",
             ""EventUser"":""{JsonEscape(eventUser)}"",
-            ""Destination"":"""",
-            ""Port"":0,
+            ""Destination"":""{JsonEscape(destinationIp)}"",
+            ""Port"":{destPort},
             ""MatchedIndicator"":""{JsonEscape(matchedIndicator)}"",
             ""SignatureName"":""{JsonEscape(signatureName)}"",
             ""Severity"":""{JsonEscape(severity)}"",
@@ -1032,6 +1068,7 @@ public class DeepVisibilitySensor {
             return null;
         };
 
+        InitializePathMap();
         UpdateThreatIntel(tiDrivers);
 
         // Start the dedicated ML consumer thread with Micro-Batching
@@ -1186,12 +1223,10 @@ public class DeepVisibilitySensor {
                             if (!ttpMatched) {
                                 List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
 
-                                string sigmaActor = actorName.StartsWith("\\") ? actorName : "\\" + actorName;
-
                                 for (int i = 0; i < matrix.WmiRules.Length; i++) {
                                     var rule = matrix.WmiRules[i];
 
-                                    if (EvaluateSigmaRule(rule, dynamicPayload, "", sigmaActor, "", "")) {
+                                    if (EvaluateSigmaRule(rule, dynamicPayload, "", actorName, "", "")) {
                                         matchedSigmaRules.Add(rule);
                                     }
                                 }
@@ -1223,7 +1258,8 @@ public class DeepVisibilitySensor {
 
         var kernelKeywords = KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Registry |
             KernelTraceEventParser.Keywords.FileIOInit | KernelTraceEventParser.Keywords.FileIO |
-            KernelTraceEventParser.Keywords.ImageLoad | KernelTraceEventParser.Keywords.Memory;
+            KernelTraceEventParser.Keywords.ImageLoad | KernelTraceEventParser.Keywords.Memory |
+            KernelTraceEventParser.Keywords.NetworkTCPIP;
 
         _session.EnableKernelProvider(kernelKeywords);
 
@@ -1232,7 +1268,7 @@ public class DeepVisibilitySensor {
                 string image = GetProcessName(data.ProcessID);
                 if (data.ProcessID == SensorPid) return;
 
-                string path = data.FileName ?? "";
+                string path = ResolveDosPath(data.FileName ?? "");
                 if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
                     return;
                 }
@@ -1289,8 +1325,8 @@ public class DeepVisibilitySensor {
 
                 if (!ttpMatched) {
                     List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
-                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
 
+                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
                     for (int i = 0; i < matrix.ImgRules.Length; i++) {
                         var rule = matrix.ImgRules[i];
 
@@ -1307,10 +1343,91 @@ public class DeepVisibilitySensor {
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
                             EnqueueAlert("Sigma_Match", "Image_Load", image, "", data.ProcessID, 0, data.ThreadID, path, "", "Suspicious Module Load", mRule.title, mRule.severity, mRule.tags);
+                            SuppressProcessRule(image, cacheRuleName);
+                        } else {
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, path, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
+
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, path, path, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
                         }
                     }
                 }
                 EnqueueRaw("ImageLoad", image, "Unknown", path, "", data.ProcessID, data.ThreadID);
+            } catch { }
+        };
+
+        _session.Source.Kernel.TcpIpConnect += delegate (TcpIpConnectTraceData data) {
+            try {
+                if (data.ProcessID == SensorPid) return;
+                string image = GetProcessName(data.ProcessID);
+
+                string destIp = data.daddr.ToString();
+                int destPort = data.dport;
+
+                if (destIp == "127.0.0.1" || destIp == "::1") return;
+
+                var matrix = _activeMatrix;
+                bool ttpMatched = false;
+                TtpRuleMatrix ttpMatrix = _ttpMatrix;
+
+                if (ttpMatrix.NetRules != null) {
+                    List<HighFidelityTTPRule> matchedTtpRules = new List<HighFidelityTTPRule>();
+                    string matchedTrigger = "";
+
+                    for (int i = 0; i < ttpMatrix.NetRules.Length; i++) {
+                        var rule = ttpMatrix.NetRules[i];
+                        string trigger = rule.TriggerStrings.FirstOrDefault(t => destIp.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0 || destPort.ToString() == t);
+
+                        if (trigger != null) {
+                            if (rule.actor_process == "**" || image.Equals(rule.actor_process, StringComparison.OrdinalIgnoreCase)) {
+                                matchedTtpRules.Add(rule);
+                                if (string.IsNullOrEmpty(matchedTrigger)) matchedTrigger = trigger;
+                            }
+                        }
+                    }
+
+                    if (matchedTtpRules.Count > 0) {
+                        string alertMessage = $"TTP Match: {matchedTtpRules[0].signature_name}";
+                        EnqueueTtpAlert("AdvancedDetection", image, "Unknown", data.ProcessID, 0, data.ThreadID, destIp, alertMessage, matchedTrigger, matchedTtpRules[0]);
+                        ttpMatched = true;
+                    }
+                }
+
+                if (!ttpMatched) {
+                    List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
+
+                    for (int i = 0; i < matrix.NetRules.Length; i++) {
+                        var rule = matrix.NetRules[i];
+                        if (EvaluateSigmaRule(rule, destIp, destPort.ToString(), image, "", "")) {
+                            matchedSigmaRules.Add(rule);
+                        }
+                    }
+
+                    foreach (var mRule in matchedSigmaRules) {
+                        string cacheRuleName = mRule.id;
+                        int bracketIdx = cacheRuleName.IndexOf('[');
+                        if (bracketIdx >= 0) cacheRuleName = cacheRuleName.Substring(0, bracketIdx).Trim();
+                        string cacheKey = $"{image}|{cacheRuleName}";
+
+                        if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
+                            string jsonEvent = BuildEnrichedJson("Sigma_Match", "Network_Connection", image, "", data.ProcessID, 0, data.ThreadID, destIp, "Suspicious Outbound Connection", destPort.ToString(), mRule.id, mRule.title, mRule.title, mRule.severity, mRule.tags, destIp, destPort);
+                            if (jsonEvent != null) { SafeEnqueueEvent(jsonEvent); }
+                            SuppressProcessRule(image, cacheRuleName);
+                        } else {
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, destIp, "", destPort.ToString(), mRule.id, "", mRule.title, mRule.severity, mRule.tags, destIp, destPort);
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, destIp, destPort.ToString(), data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
+                        }
+                    }
+                }
+
+                string rawJson = BuildEnrichedJson("RawEvent", "NetworkConnect", image, "", data.ProcessID, 0, data.ThreadID, "", "", "", "NetworkConnect", "", "", "", "", destIp, destPort);
+                if (rawJson != null && _aggregator != null) {
+                    _aggregator.AddEvent(rawJson, "", image, "NetworkConnect", "", destIp, destPort.ToString(), data.ThreadID, GetEventUser(data.ProcessID));
+                }
+
             } catch { }
         };
 
@@ -1341,13 +1458,13 @@ public class DeepVisibilitySensor {
             }
 
             if (unbackedFrames >= 2 || forgedReturns > 0) {
-                EventQueue.Enqueue($"{{\"Category\":\"StaticAlert\", \"Type\":\"StackSpoofDetected\", \"Process\":\"PID:{data.ProcessID}\", \"Reason\":\"{unbackedFrames} unbacked frames | {forgedReturns} forged returns\", \"Action\":\"QueueForQuarantine\"}}");
+                EnqueueAlert("StaticAlert", "StackSpoofDetected", GetProcessName(data.ProcessID), "Unknown", data.ProcessID, 0, data.ThreadID, "", $"{unbackedFrames} unbacked frames | {forgedReturns} forged returns");
             }
         };
 
         _session.Source.Kernel.ProcessStart += delegate (ProcessTraceData data) {
             try {
-                string path = data.ImageFileName ?? "";
+                string path = ResolveDosPath(data.ImageFileName ?? "");
                 string cmd = data.CommandLine ?? "";
                 string image = data.ImageFileName ?? "";
 
@@ -1418,7 +1535,6 @@ public class DeepVisibilitySensor {
 
                     string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
                     string sigmaParent = parentName.StartsWith("\\") ? parentName : "\\" + parentName;
-
                     for (int i = 0; i < matrix.ProcRules.Length; i++) {
                         var rule = matrix.ProcRules[i];
                         if (EvaluateSigmaRule(rule, cmd, path, sigmaImage, sigmaParent, "")) {
@@ -1434,6 +1550,13 @@ public class DeepVisibilitySensor {
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
                             EnqueueAlert("Sigma_Match", "Process_Creation", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", "Suspicious Process", mRule.title, mRule.severity, mRule.tags);
+                            SuppressProcessRule(image, cacheRuleName);
+                        } else {
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
+
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, parentName, image, "Suppressed_Rule_Hit", mRule.id, cmd, path, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
                         }
                     }
                 }
@@ -1510,8 +1633,8 @@ public class DeepVisibilitySensor {
 
                 if (!ttpMatched) {
                     List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
-                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
 
+                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
                     for (int i = 0; i < matrix.RegRules.Length; i++) {
                         var rule = matrix.RegRules[i];
                         if (EvaluateSigmaRule(rule, "", "", sigmaImage, "", fullReg)) {
@@ -1527,6 +1650,13 @@ public class DeepVisibilitySensor {
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
                             EnqueueAlert("Sigma_Match", "Registry_Event", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", "Suspicious Registry Modification", mRule.title, mRule.severity, mRule.tags);
+                            SuppressProcessRule(image, cacheRuleName);
+                        } else {
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", fullReg, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
+
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, fullReg, fullReg, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
                         }
                     }
                 }
@@ -1539,7 +1669,7 @@ public class DeepVisibilitySensor {
                 string image = GetProcessName(data.ProcessID);
                 if (data.ProcessID == SensorPid) return;
 
-                string path = data.FileName ?? "";
+                string path = ResolveDosPath(data.FileName ?? "");
                 if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
                         return;
                     }
@@ -1598,8 +1728,8 @@ public class DeepVisibilitySensor {
 
                 if (!ttpMatched) {
                     List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
-                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
 
+                    string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
                     for (int i = 0; i < matrix.FileRules.Length; i++) {
                         var rule = matrix.FileRules[i];
                         if (EvaluateSigmaRule(rule, "", path, sigmaImage, "", "")) {
@@ -1615,6 +1745,13 @@ public class DeepVisibilitySensor {
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
                             EnqueueAlert("Sigma_Match", "File_Event", image, "", data.ProcessID, 0, data.ThreadID, path, "", "Suspicious File IO", mRule.title, mRule.severity, mRule.tags);
+                            SuppressProcessRule(image, cacheRuleName);
+                        } else {
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, path, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
+
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, path, path, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
                         }
                     }
                 }
@@ -1625,7 +1762,7 @@ public class DeepVisibilitySensor {
         _session.Source.Kernel.FileIOWrite += delegate (FileIOReadWriteTraceData data) {
             if (data.ProcessID == SensorPid) return;
 
-            string path = data.FileName ?? "";
+            string path = ResolveDosPath(data.FileName ?? "");
             if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
                 return;
             }
@@ -1702,14 +1839,37 @@ public class DeepVisibilitySensor {
             _session = null;
         }
 
-        string umSessionName = "DeepSensor_UserMode";
-        if (TraceEventSession.GetActiveSessionNames().Contains(umSessionName)) {
-            Task.Run(() => {
-                try {
-                    using (var old = new TraceEventSession(umSessionName)) { old.Stop(true); }
-                } catch { }
-            }).Wait(1000);
-        }
+        Task.Run(() => {
+            try {
+                // Query the OS for all currently running ETW trace sessions
+                var activeSessions = TraceEventSession.GetActiveSessionNames();
+                var sessionsToKill = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Add the Kernel Logger if it is currently running
+                string kernelSession = KernelTraceEventParser.KernelSessionName;
+                if (activeSessions.Contains(kernelSession)) {
+                    sessionsToKill.Add(kernelSession);
+                }
+
+                // Add ANY session that starts with "DeepSensor" (Catches UserMode, leaks, etc.)
+                foreach (string sessionName in activeSessions) {
+                    if (sessionName.StartsWith("DeepSensor", StringComparison.OrdinalIgnoreCase)) {
+                        sessionsToKill.Add(sessionName);
+                    }
+                }
+
+                // Execute targeted teardown
+                foreach (string targetSession in sessionsToKill) {
+                    try {
+                        using (var orphaned = new TraceEventSession(targetSession)) {
+                            orphaned.Stop(true); // true = forceful stop
+                        }
+                    } catch {
+                        // Silently swallow access/not-found errors during teardown
+                    }
+                }
+            } catch { }
+        }).Wait(2000); // Allow up to 2 seconds for kernel objects to release
 
         if (_umThread != null && _umThread.IsAlive) {
             _umThread.Join(500);
@@ -1762,7 +1922,6 @@ public class DeepVisibilitySensor {
 
     // EnqueueAlert with Fingerprinting + Full Config Exclusions
     public static void EnqueueAlert(string category, string eventType, string process, string parentProcess, int pid, int parentPid, int tid, string cmdline, string details, string matchedIndicator = "", string signatureName = "", string severity = "", string tags = "") {
-        if (_mlEnginePtr == IntPtr.Zero) return;
 
         string jsonEvent = BuildEnrichedJson(category, eventType, process, parentProcess, pid, parentPid, tid, cmdline, details, "", "", matchedIndicator, signatureName, severity, tags);
         if (jsonEvent == null) return;
@@ -1770,8 +1929,11 @@ public class DeepVisibilitySensor {
         Interlocked.Increment(ref TotalAlertsGenerated);
 
         try {
-            if (!_mlWorkQueue.IsAddingCompleted) {
-                _mlWorkQueue.Add(jsonEvent);
+            if (_mlEnginePtr != IntPtr.Zero) {
+                if (!_mlWorkQueue.IsAddingCompleted)
+                    _mlWorkQueue.Add(jsonEvent);
+            } else {
+                EventQueue.Enqueue(jsonEvent);
             }
         } catch (InvalidOperationException) { }
     }
@@ -1821,13 +1983,14 @@ public class DeepVisibilitySensor {
         Interlocked.Increment(ref TotalEventsParsed);
         if (_mlEnginePtr == IntPtr.Zero) return;
 
+        string eventUser = GetEventUser(pid);
         string jsonEvent = BuildEnrichedJson("RawEvent", type, process, parent, pid, 0, tid, cmd, "", path, type, "");
         if (jsonEvent == null) return;
 
         try {
             if (!_mlWorkQueue.IsAddingCompleted) {
                 if (_aggregator != null)
-                    _aggregator.AddEvent(jsonEvent, parent, process, type, "", cmd, path, tid);
+                    _aggregator.AddEvent(jsonEvent, parent, process, type, "", cmd, path, tid, eventUser);
                 else
                     _mlWorkQueue.Add(jsonEvent);
             }

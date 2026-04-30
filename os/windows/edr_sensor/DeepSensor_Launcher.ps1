@@ -163,6 +163,8 @@ if (Test-Path $global:TerminateSwitchPath) {
     Remove-Item -Path $global:TerminateSwitchPath -Force -ErrorAction SilentlyContinue
 }
 
+$global:SecureStaging = "C:\ProgramData\DeepSensor\Staging"
+if (-not (Test-Path $global:SecureStaging)) { New-Item -ItemType Directory -Path $global:SecureStaging -Force | Out-Null }
 # ======================================================================
 # 3. HELPER FUNCTIONS
 # ======================================================================
@@ -288,7 +290,9 @@ function Assert-ServiceStability {
 
     if ($RecentStarts.Count -ge 10) {
         Write-Diag "CIRCUIT BREAKER TRIPPED: Sensor failed 10 times within 60 minutes. Halting to protect OS." "CRITICAL"
-        Set-Service -Name "DeepSensorService" -StartupType Disabled -ErrorAction SilentlyContinue
+        if (Get-Service -Name "DeepSensorService" -ErrorAction Ignore) {
+            Set-Service -Name "DeepSensorService" -StartupType Disabled -ErrorAction Ignore
+        }
         Exit 0
     }
 
@@ -1078,6 +1082,15 @@ function Submit-SensorAlert {
 
     # 1. Deduplication Logic
     $dedupKey = "$($Type)_$($TargetObject)_$($Flags)_$($Image)"
+
+    if ($null -eq $global:HistoricalAlerts) {
+        $global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    }
+
+    if ($Type -ne "TTP_Match" -and -not $global:HistoricalAlerts.Add($dedupKey)) {
+        return
+    }
+
     $isNewAlert = -not $global:cycleAlerts.ContainsKey($dedupKey)
 
     if (-not $isNewAlert) {
@@ -1138,7 +1151,7 @@ function Protect-SensorEnvironment {
     $DataDir = "C:\ProgramData\DeepSensor\Data"
     if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
-    $PathsToLock = @($ScriptDir, (Join-Path $ScriptDir "sigma"))
+    $PathsToLock = @($ScriptDir, $global:SecureStaging)
     foreach ($p in $PathsToLock) {
         if (Test-Path $p) {
             $null = icacls $p /inheritance:r /q
@@ -1308,7 +1321,11 @@ function Initialize-TraceEventDependency {
         New-Item -ItemType Directory -Path $ExtractBase -Force | Out-Null
 
         $SecureStaging = "C:\ProgramData\DeepSensor\Staging"
-        if (-not (Test-Path $SecureStaging)) { New-Item -ItemType Directory -Path $SecureStaging -Force | Out-Null }
+        if (-not (Test-Path $SecureStaging)) {
+            New-Item -ItemType Directory -Path $SecureStaging -Force | Out-Null
+        }
+
+        $null = icacls $SecureStaging /reset /T /C /Q *>$null
 
         $TE_Zip = "$SecureStaging\TE.zip"
         $UN_Zip = "$SecureStaging\UN.zip"
@@ -1318,7 +1335,7 @@ function Initialize-TraceEventDependency {
             Copy-Item (Join-Path $OfflineRepoPath "unsafe.nupkg") -Destination $UN_Zip -Force
         } else {
             $TE_Url = "https://www.nuget.org/api/v2/package/Microsoft.Diagnostics.Tracing.TraceEvent/3.2.2"
-            $UN_Url = "https://www.nuget.org/api/v2/package/System.Runtime.CompilerServices.Unsafe/5.0.0"
+            $UN_Url = "https://www.nuget.org/api/v2/package/System.Runtime.CompilerServices.Unsafe/6.1.0"
             Invoke-WebRequest -Uri $TE_Url -OutFile $TE_Zip -UseBasicParsing
             Invoke-WebRequest -Uri $UN_Url -OutFile $UN_Zip -UseBasicParsing
         }
@@ -1410,10 +1427,9 @@ function Invoke-EnvironmentalAudit {
 function Sync-YaraIntelligence {
     Write-Diag "Syncing YARA Intelligence (Elastic & ReversingLabs)..." "STARTUP"
 
-    $YaraBaseDir = Join-Path $ScriptDir "yara"
-    $VectorDir = if ($OfflineRepoPath) { Join-Path $OfflineRepoPath "yara_rules" } else { Join-Path $ScriptDir "yara_rules" }
-
-    $CacheMarker = Join-Path $ScriptDir "yara.cache"
+    $YaraBaseDir = Join-Path $global:SecureStaging "yara"
+    $VectorDir = if ($OfflineRepoPath) { Join-Path $OfflineRepoPath "yara_rules" } else { Join-Path $global:SecureStaging "yara_rules" }
+    $CacheMarker = Join-Path $global:SecureStaging "yara.cache"
     $needsDownload = $true
 
     if (Test-Path $CacheMarker) {
@@ -1434,6 +1450,7 @@ function Sync-YaraIntelligence {
 
         $SecureStaging = "C:\ProgramData\DeepSensor\Staging"
         if (-not (Test-Path $SecureStaging)) { New-Item -ItemType Directory -Path $SecureStaging -Force | Out-Null }
+        $null = icacls $SecureStaging /reset /T /C /Q *>$null
 
         foreach ($src in $Sources) {
             $TempZip = "$SecureStaging\$($src.Name).zip"
@@ -1501,14 +1518,34 @@ function Sync-YaraIntelligence {
 }
 
 function Compile-SigmaRulesToBase64 {
-    $LocalSigmaDir = Join-Path $ScriptDir "sigma"
-    if (-not (Test-Path $LocalSigmaDir)) { return "" }
+    $StagingSigmaDir = Join-Path $global:SecureStaging "sigma"
+    $CustomSigmaDir  = Join-Path $ScriptDir "sigma"
 
-    $SigmaFiles = Get-ChildItem -Path $LocalSigmaDir -Include "*.yml", "*.yaml" -Recurse
+    $SigmaFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+
+    # Ingest the dynamically downloaded SigmaHQ rules from the secure staging area
+    if (Test-Path $StagingSigmaDir) {
+        Get-ChildItem -Path $StagingSigmaDir -Include "*.yml", "*.yaml" -Recurse | ForEach-Object { $SigmaFiles.Add($_) }
+    }
+
+    # Ingest custom rules from the project directory
+    if (Test-Path $CustomSigmaDir) {
+        $customCount = 0
+        Get-ChildItem -Path $CustomSigmaDir -Include "*.yml", "*.yaml" -Recurse | ForEach-Object {
+            $SigmaFiles.Add($_)
+            $customCount++
+        }
+        if ($customCount -gt 0) {
+            Write-Diag "    [+] Integrated $customCount custom Sigma rules from project root." "STARTUP"
+        }
+    }
+
+    if ($SigmaFiles.Count -eq 0) { return "" }
+
     $RuleStrings = [System.Collections.Generic.List[string]]::new()
     $ParsedCount = 0
 
-    Write-Diag "    [*] Compiling local Sigma rules into Boolean AST Matrices..." "STARTUP"
+    Write-Diag "    [*] Compiling $($SigmaFiles.Count) total Sigma rules into Boolean AST Matrices..." "STARTUP"
 
     foreach ($file in $SigmaFiles) {
         $lines = Get-Content $file.FullName
@@ -1528,6 +1565,7 @@ function Compile-SigmaRulesToBase64 {
         if ($content -match "(?im)^\s*category:\s*registry") { $category = "registry_event" }
         elseif ($content -match "(?im)^\s*category:\s*file") { $category = "file_event" }
         elseif ($content -match "(?im)^\s*category:\s*image") { $category = "image_load" }
+        elseif ($content -match "(?im)^\s*category:\s*network_connection") { $category = "network_connection" }
 
         $condition = ""
         if ($content -match "(?im)^\s*condition:\s*(.+)") { $condition = $matches[1].Trim() }
@@ -1634,18 +1672,38 @@ function Compile-SigmaRulesToBase64 {
             $fields = [System.Collections.Generic.List[string]]::new()
             foreach ($fName in $blocks[$bName].Keys) {
                 $cleanField = $fName -replace "\|.*", ""
-                $matchType = "Contains"
-                if ($fName -match "(?i)\|endswith") { $matchType = "EndsWith" }
-                elseif ($fName -match "(?i)\|startswith") { $matchType = "StartsWith" }
-                elseif ($fName -match "(?i)\|equals") { $matchType = "Exact" }
+                $baseMatchType = "Exact"
+                if ($fName -match "(?i)\|endswith") { $baseMatchType = "EndsWith" }
+                elseif ($fName -match "(?i)\|startswith") { $baseMatchType = "StartsWith" }
+                elseif ($fName -match "(?i)\|contains") { $baseMatchType = "Contains" }
 
                 $matchAll = if ($fName -match "(?i)\|all") { "true" } else { "false" }
 
-                $vals = $blocks[$bName][$fName] -join "`t"
-                if ([string]::IsNullOrWhiteSpace($vals)) { continue }
+                $parsedVals = [System.Collections.Generic.List[string]]::new()
+                foreach ($val in $blocks[$bName][$fName]) {
+                    $finalType = $baseMatchType
+                    if ($baseMatchType -eq "Exact") {
+                        # Translate Sigma asterisks into explicit C# matching logic
+                        if ($val -match "^\*(.*)\*$") { $finalType = "Contains"; $val = $matches[1] }
+                        elseif ($val -match "^\*(.*)$") { $finalType = "EndsWith"; $val = $matches[1] }
+                        elseif ($val -match "^(.*)\*$") { $finalType = "StartsWith"; $val = $matches[1] }
+                    } else {
+                        # If a modifier was explicitly declared, just strip the wildcards
+                        $val = $val -replace "^\*", "" -replace "\*$", ""
+                    }
+                    $parsedVals.Add(("{0}={1}" -f $finalType, $val))
+                }
 
-                $formattedField = "{0}:{1}:{2}:{3}" -f $cleanField, $matchType, $matchAll, $vals
-                $fields.Add($formattedField)
+                if ($parsedVals.Count -eq 0) { continue }
+
+                # Group by the dominant match type to satisfy the C# struct
+                $grouped = $parsedVals | Group-Object { ($_ -split "=")[0] }
+                foreach ($grp in $grouped) {
+                    $grpType = $grp.Name
+                    $grpVals = ($grp.Group | ForEach-Object { ($_ -split "=", 2)[1] }) -join "`t"
+                    if ([string]::IsNullOrWhiteSpace($grpVals)) { continue }
+                    $fields.Add(("{0}:{1}:{2}:{3}" -f $cleanField, $grpType, $matchAll, $grpVals))
+                }
             }
             if ($fields.Count -gt 0) {
                 $serializedBlocks.Add(("{0}>{1}" -f $bName, ($fields -join "^")))
@@ -1662,7 +1720,8 @@ function Compile-SigmaRulesToBase64 {
 
     $BuiltInCmds = @("sekurlsa::logonpasswords", "lsadump::", "privilege::debug", "Invoke-BloodHound", "procdump -ma lsass", "vssadmin delete shadows")
     foreach ($c in $BuiltInCmds) {
-        $RuleStrings.Add(("{0}|{1}|{2}|{3}|{4}" -f "process_creation", "Built-in Core TI Signature", "High", "b1", ("b1>CommandLine:Contains:false:" + $c)))
+        $builtInId = [guid]::NewGuid().ToString()
+        $RuleStrings.Add(("{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f "process_creation", "Built-in Core TI Signature", $builtInId, "high", "N/A", "b1", ("b1>CommandLine:Contains:false:" + $c)))
     }
 
     Write-Diag "    [+] Sigma Compilation Complete: $ParsedCount rules natively mapped to AST." "STARTUP"
@@ -1740,6 +1799,7 @@ function Compile-TtpSignaturesToBase64 {
             if ($type -match "FILE") { $category = "file_event" }
             elseif ($type -match "REGISTRY") { $category = "registry_event" }
             elseif ($type -match "MODULE") { $category = "image_load" }
+            elseif ($type -match "NETWORK") { $category = "network_connection" }
 
             $b64Trigger          = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($target))
             $b64Exclusion        = if ($excludePath)       { [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($excludePath)) } else { "" }
@@ -1768,7 +1828,7 @@ function Compile-TtpSignaturesToBase64 {
 
 function Invoke-StagingInjection {
     $StagingDir = "$ScriptDir\sigma_staging"
-    $SigmaDir = "$ScriptDir\sigma"
+    $SigmaDir = Join-Path $global:SecureStaging "sigma"
 
     if (-not (Test-Path $StagingDir)) {
         Write-Diag "`n[*] Staging directory '\sigma_staging' has no rules. Skipping." "STARTUP"
@@ -1803,10 +1863,10 @@ function Invoke-StagingInjection {
 function Initialize-SigmaEngine {
     Write-Diag "Initializing Sigma Compiler & Threat Intelligence Matrices..." "STARTUP"
 
-    $LocalSigmaDir = Join-Path $ScriptDir "sigma"
+    $LocalSigmaDir = Join-Path $global:SecureStaging "sigma"
     if (-not (Test-Path $LocalSigmaDir)) { New-Item -ItemType Directory -Path $LocalSigmaDir -Force | Out-Null }
 
-    $SigmaCacheMarker = Join-Path $ScriptDir "sigma.cache"
+    $SigmaCacheMarker = Join-Path $global:SecureStaging "sigma.cache"
     $needsSigmaDownload = $true
 
     if (Test-Path $SigmaCacheMarker) {
@@ -1867,7 +1927,7 @@ function Initialize-SigmaEngine {
     $OfflineDrivers = @("capcom.sys", "iqvw64.sys", "RTCore64.sys", "gdrv.sys", "AsrDrv.sys", "procexp.sys")
     foreach ($d in $OfflineDrivers) { [void]$TiDriverSignatures.Add($d) }
 
-    $LolDriversCache = Join-Path $ScriptDir "loldrivers.json"
+    $LolDriversCache = Join-Path $global:SecureStaging "loldrivers.json"
     $needsDriverDownload = $true
     if (Test-Path $LolDriversCache) {
         if (((Get-Date) - (Get-Item $LolDriversCache).LastWriteTime).TotalHours -lt 24) { $needsDriverDownload = $false }
@@ -2020,7 +2080,7 @@ try {
         "System", "System.Core", "System.Collections",
         "System.Collections.Concurrent", "System.Runtime", "System.Diagnostics.Process",
         "System.Linq", "System.Linq.Expressions", "System.ComponentModel", "System.ComponentModel.Primitives", "netstandard",
-        "System.Threading", "System.Threading.Thread"
+        "System.Threading", "System.Threading.Thread", "System.Net.Primitives"
     )
 
     if ($SiblingDlls) {
@@ -2083,7 +2143,7 @@ try {
     }
 
     Sync-YaraIntelligence
-    $YaraRulesPath = if ($OfflineRepoPath) { Join-Path $OfflineRepoPath "yara_rules" } else { Join-Path $ScriptDir "yara_rules" }
+    $YaraRulesPath = if ($OfflineRepoPath) { Join-Path $OfflineRepoPath "yara_rules" } else { Join-Path $global:SecureStaging "yara_rules" }
     [DeepVisibilitySensor]::InitializeYaraMatrices($YaraRulesPath)
     [DeepVisibilitySensor]::IsArmed = $ArmedMode.IsPresent
 
@@ -2268,6 +2328,17 @@ $LastPolicySync = Get-Date
 $lastLightGC = Get-Date
 $lastUebaCleanup = Get-Date
 
+$global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$global:HistoricalSuppressions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$HistoricalAlertsPath = "C:\ProgramData\DeepSensor\Data\HistoricalAlerts.dat"
+if (Test-Path $HistoricalAlertsPath) {
+    try {
+        Get-Content $HistoricalAlertsPath -Encoding UTF8 | ForEach-Object {
+            if (-not [string]::IsNullOrWhiteSpace($_)) { [void]$global:HistoricalAlerts.Add($_) }
+        }
+    } catch {}
+}
+
 if (-not $Background) {
     Draw-Dashboard -Events 0 -MlEvals 0 -Alerts 0 -EtwHealth "ONLINE" -MlHealth "Native DLL"
     Draw-AlertWindow
@@ -2304,7 +2375,10 @@ try {
             if (-not $Background) { Write-Host "`n[!] Shutdown signal received..." -ForegroundColor Yellow }
 
             Remove-Item -Path $global:TerminateSwitchPath -Force -ErrorAction SilentlyContinue
-            Set-Service -Name "DeepSensorService" -StartupType Disabled -ErrorAction SilentlyContinue
+
+            if (Get-Service -Name "DeepSensorService" -ErrorAction Ignore) {
+                Set-Service -Name "DeepSensorService" -StartupType Disabled -ErrorAction Ignore
+            }
             break
         }
 
@@ -2363,6 +2437,10 @@ try {
                             # ──────────────────────────────────────────────────────────────
                             $LocalTS = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
 
+                            if ($null -eq $global:HistoricalSuppressions) {
+                                $global:HistoricalSuppressions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                            }
+
                             # 1. MAIN SIEM (HOT INDEX) + HUD ESCALATION
                             if ($alert.score -ge 0.8) {
                                 [DeepVisibilitySensor]::TotalAlertsGenerated++
@@ -2391,48 +2469,90 @@ try {
 
                             # 2. SECURED BASELINE: UEBA SIEM (COLD INDEX) + HUD NOTICE
                             if ($alert.score -eq -1.0) {
-                                Add-AlertMessage $alert.reason $cDark
-                                $logObj = [ordered]@{
-                                    Timestamp_Local = $LocalTS
-                                    Category = "UEBA_Audit"
-                                    Type = "Secured"
-                                    Process = $alert.process
-                                    Details = $alert.reason
-                                    SignatureName = $alert.signature_name
-                                    Tactic = $alert.tactic
-                                    Technique = $alert.technique
-                                    MatchedIndicator = $alert.matched_indicator
-                                    Cmd = $safeCmd
-                                    EventUser = [DeepVisibilitySensor]::SensorUser
-                                    ComputerName = [DeepVisibilitySensor]::HostComputerName
-                                    IP = [DeepVisibilitySensor]::HostIP
-                                    OS = $OsContext
+                                # TTP matches must always surface — never route to UEBA-only
+                                if ($alert.reason -match "\[TTP\]") {
+                                    Submit-SensorAlert -Type "TTP_Match" `
+                                        -TargetObject $alert.destination `
+                                        -Image $alert.process `
+                                        -Flags $alert.reason `
+                                        -Confidence 100 `
+                                        -PID_Id $alert.pid `
+                                        -TID_Id $alert.tid `
+                                        -AttckMapping "N/A" `
+                                        -CommandLine $safeCmd `
+                                        -RawJson ($alert | ConvertTo-Json -Compress) `
+                                        -MatchedIndicator $alert.matched_indicator
+                                    continue
                                 }
-                                $script:uebaBatch.Add(($logObj | ConvertTo-Json -Compress))
-                                try { [DeepVisibilitySensor]::SuppressProcessRule($alert.process, $alert.reason) } catch {}
+
+                                $suppressionKey = "PROC_$($alert.process)_$($alert.reason)"
+
+                                if ($global:HistoricalSuppressions.Add($suppressionKey)) {
+                                    Add-AlertMessage $alert.reason $cDark
+                                    try { [DeepVisibilitySensor]::SuppressProcessRule($alert.process, $alert.reason) } catch {}
+
+                                    $logObj = [ordered]@{
+                                        Timestamp_Local = $LocalTS
+                                        Category = "UEBA_Audit"
+                                        Type = "Secured"
+                                        Process = $alert.process
+                                        Details = $alert.reason
+                                        SignatureName = $alert.signature_name
+                                        Tactic = $alert.tactic
+                                        Technique = $alert.technique
+                                        MatchedIndicator = $alert.matched_indicator
+                                        Cmd = $safeCmd
+                                        EventUser = [DeepVisibilitySensor]::SensorUser
+                                        ComputerName = [DeepVisibilitySensor]::HostComputerName
+                                        IP = [DeepVisibilitySensor]::HostIP
+                                        OS = $OsContext
+                                    }
+                                    $script:uebaBatch.Add(($logObj | ConvertTo-Json -Compress))
+                                }
                                 continue
                             }
 
                             # 3. GLOBAL SUPPRESSION: UEBA SIEM (COLD INDEX) ONLY
                             if ($alert.score -eq -2.0) {
-                                try { [DeepVisibilitySensor]::SuppressSigmaRule($alert.reason) } catch {}
-                                $logObj = [ordered]@{
-                                    Timestamp_Local = $LocalTS
-                                    Category = "UEBA_Audit"
-                                    Type = "Suppressed"
-                                    Process = $alert.process
-                                    Details = $alert.reason
-                                    SignatureName = $alert.signature_name
-                                    Tactic = $alert.tactic
-                                    Technique = $alert.technique
-                                    MatchedIndicator = $alert.matched_indicator
-                                    Cmd = $safeCmd
-                                    EventUser = [DeepVisibilitySensor]::SensorUser
-                                    ComputerName = [DeepVisibilitySensor]::HostComputerName
-                                    IP = [DeepVisibilitySensor]::HostIP
-                                    OS = $OsContext
+                                # TTP matches are never globally suppressed
+                                if ($alert.reason -match "\[TTP\]") {
+                                    Submit-SensorAlert -Type "TTP_Match" `
+                                        -TargetObject $alert.destination `
+                                        -Image $alert.process `
+                                        -Flags $alert.reason `
+                                        -Confidence 100 `
+                                        -PID_Id $alert.pid `
+                                        -TID_Id $alert.tid `
+                                        -AttckMapping "N/A" `
+                                        -CommandLine $safeCmd `
+                                        -RawJson ($alert | ConvertTo-Json -Compress) `
+                                        -MatchedIndicator $alert.matched_indicator
+                                    continue
                                 }
-                                $script:uebaBatch.Add(($logObj | ConvertTo-Json -Compress))
+
+                                $suppressionKey = "SIGMA_$($alert.reason)"
+
+                                if ($global:HistoricalSuppressions.Add($suppressionKey)) {
+                                    try { [DeepVisibilitySensor]::SuppressSigmaRule($alert.reason) } catch {}
+
+                                    $logObj = [ordered]@{
+                                        Timestamp_Local = $LocalTS
+                                        Category = "UEBA_Audit"
+                                        Type = "Suppressed"
+                                        Process = $alert.process
+                                        Details = $alert.reason
+                                        SignatureName = $alert.signature_name
+                                        Tactic = $alert.tactic
+                                        Technique = $alert.technique
+                                        MatchedIndicator = $alert.matched_indicator
+                                        Cmd = $safeCmd
+                                        EventUser = [DeepVisibilitySensor]::SensorUser
+                                        ComputerName = [DeepVisibilitySensor]::HostComputerName
+                                        IP = [DeepVisibilitySensor]::HostIP
+                                        OS = $OsContext
+                                    }
+                                    $script:uebaBatch.Add(($logObj | ConvertTo-Json -Compress))
+                                }
                                 continue
                             }
 
@@ -2555,6 +2675,20 @@ try {
 
         # === DEEP MEMORY RECLAMATION: LOH COMPACTION (every 60 seconds) ===
         if (($now - $lastLightGC).TotalSeconds -ge 60) {
+
+            # Prevent Gatekeeper Memory Exhaustion (Cap at 50,000 tracked signatures)
+            if ($null -ne $global:HistoricalAlerts) {
+                if ($global:HistoricalAlerts.Count -gt 50000) {
+                    Write-Diag "[MAINTENANCE] Historical Alerts matrix reached capacity. Flushing state." "INFO"
+                    $global:HistoricalAlerts.Clear()
+                }
+                try { $global:HistoricalAlerts | Out-File -FilePath $HistoricalAlertsPath -Encoding UTF8 -Force -ErrorAction Stop } catch {}
+            }
+            if ($null -ne $global:HistoricalSuppressions -and $global:HistoricalSuppressions.Count -gt 50000) {
+                Write-Diag "[MAINTENANCE] Historical Suppressions matrix reached capacity. Flushing state." "INFO"
+                $global:HistoricalSuppressions.Clear()
+            }
+
             [System.Runtime.GCSettings]::LargeObjectHeapCompactionMode = [System.Runtime.GCLargeObjectHeapCompactionMode]::CompactOnce
             [System.GC]::Collect(2, [System.GCCollectionMode]::Forced, $true, $true)
             [System.GC]::WaitForPendingFinalizers()
@@ -2624,11 +2758,19 @@ try {
         }
     }
 } catch {
-    Write-Host "`n[!] ORCHESTRATOR FATAL CRASH: $($_.Exception.Message)" -ForegroundColor Red
-    "[$((Get-Date).ToString('HH:mm:ss'))] ORCHESTRATOR FATAL CRASH: $($_.Exception.Message)" | Out-File -FilePath "$env:ProgramData\DeepSensor\Logs\DeepSensor_Diagnostic.log" -Append
+    $crashMsg = $_.Exception.Message
+    Write-Host "`n[!] ORCHESTRATOR FATAL CRASH: $crashMsg" -ForegroundColor Red
+    "[$((Get-Date).ToString('HH:mm:ss'))] ORCHESTRATOR FATAL CRASH: $crashMsg" | Out-File -FilePath "$env:ProgramData\DeepSensor\Logs\DeepSensor_Diagnostic.log" -Append
+
+    $global:FatalCrashMsg = $crashMsg
 } finally {
     Clear-Host
-    Write-Host "`n[*] Initiating Graceful Shutdown..." -ForegroundColor Cyan
+
+    if ($global:FatalCrashMsg) {
+        Write-Host "`n[!] ORCHESTRATOR CRASHED: $($global:FatalCrashMsg)`n" -ForegroundColor Red
+    }
+
+    Write-Host "[*] Initiating Graceful Shutdown..." -ForegroundColor Cyan
     try { [console]::TreatControlCAsInput = $false } catch {}
 
     Write-Host "    [*] Terminating Web HUD Runspace..." -ForegroundColor Gray
@@ -2637,39 +2779,56 @@ try {
             $global:HudRunspace.BeginStop($null, $null) | Out-Null
             $global:HudRunspace.Dispose()
         }
-    } catch {}
+    } catch { Write-Host "        [-] HUD Teardown Error: $($_.Exception.Message)" -ForegroundColor DarkRed }
 
     Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
     try {
         [DeepVisibilitySensor]::StopSession()
         [DeepVisibilitySensor]::TeardownEngine()
-    } catch {}
+    } catch { Write-Host "        [-] Engine Teardown Error: $($_.Exception.Message)" -ForegroundColor DarkRed }
 
     Write-Host "    [*] Unlocking project directory permissions..." -ForegroundColor Gray
-    if ($null -ne $ScriptDir) {
-        $null = icacls $ScriptDir /reset /T /C /Q
-    }
+    try {
+        $PathsToUnlock = @(
+            $ScriptDir,
+            "C:\ProgramData\DeepSensor\Staging",
+            "C:\ProgramData\DeepSensor\Dependencies"
+        )
+
+        foreach ($path in $PathsToUnlock) {
+            if ($null -ne $path -and (Test-Path $path)) {
+                $null = icacls $path /reset /T /C /Q *>$null
+            }
+        }
+    } catch { Write-Host "        [-] DACL Reset Error: $($_.Exception.Message)" -ForegroundColor DarkRed }
 
     Write-Host "    [*] Cleaning up centralized library dependencies..." -ForegroundColor Gray
-
-    # Strictly define and guard the Dependencies path
-    $DependenciesPath = "C:\ProgramData\DeepSensor\Dependencies"
-    if ($null -ne $DependenciesPath -and (Test-Path $DependenciesPath)) {
-        Remove-Item -Path $DependenciesPath -Recurse -Force -ErrorAction SilentlyContinue
-    }
-
-    # Strictly define and guard the Staging path
-    $StagingPath = "C:\ProgramData\DeepSensor\Staging"
-    if ($null -ne $StagingPath -and (Test-Path $StagingPath)) {
-        Remove-Item -Path "$StagingPath\*.zip" -Force -ErrorAction SilentlyContinue
-    }
+    try {
+        $StagingPath = "C:\ProgramData\DeepSensor\Staging"
+        if ($null -ne $StagingPath -and (Test-Path $StagingPath)) {
+            Remove-Item -Path "$StagingPath\*.zip" -Force -ErrorAction Stop
+        }
+    } catch { Write-Host "        [-] File Cleanup Error: $($_.Exception.Message)" -ForegroundColor DarkRed }
 
     Write-Host "`n[+] Sensor Teardown Complete. Log artifacts preserved in C:\ProgramData\DeepSensor\Logs & \Data." -ForegroundColor Green
 
     if (-not $Background) {
+        $RealErrors = $Error | Where-Object {
+            $_.Exception.Message -notmatch "DeepSensorService|Cannot find path"
+        }
+
+        if ($RealErrors.Count -gt 0 -and -not $global:FatalCrashMsg) {
+            Write-Host "`n[!] UNHANDLED PIPELINE ERROR DETECTED:`n$($RealErrors[0].Exception.Message)" -ForegroundColor Red
+        }
+
         Write-Host "`n[!] Teardown complete or fatal error encountered." -ForegroundColor Yellow
         Write-Host "Press any key to close the console..." -ForegroundColor Yellow
-        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+
+        try {
+            $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        } catch {
+            $null = Read-Host
+        }
     }
     [System.Environment]::Exit(0)
 }

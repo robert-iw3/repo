@@ -105,53 +105,7 @@ try {
 }
 
 # ============================================================================
-# 3. PROJECT SCAFFOLDING
-# ============================================================================
-Write-Host "    [*] Scaffolding Rust Library Architecture..." -ForegroundColor Gray
-if (Test-Path $ProjectDir) { Remove-Item $ProjectDir -Recurse -Force }
-New-Item -ItemType Directory -Path (Join-Path $ProjectDir "src") -Force | Out-Null
-
-$CargoTomlContent = @"
-[package]
-name = "deep_sensor_ml"
-version = "2.1.0"
-edition = "2021"
-authors = ["Robert Weber"]
-
-[lib]
-name = "deep_sensor_ml"
-crate-type = ["cdylib"]
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = 'abort'
-strip = true
-
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-regex = "1.10"
-md-5 = "0.10"
-hex = "0.4"
-rusqlite = { version = "0.31", features = ["bundled"] }
-extended-isolation-forest = "0.2"
-chrono = "0.4"
-"@
-Set-Content -Path (Join-Path $ProjectDir "Cargo.toml") -Value $CargoTomlContent
-
-# DEVELOPER NOTE: Targeting lib.rs for DLL compilation instead of main.rs
-$MainRsRoot = Join-Path $WorkingDir "lib.rs"
-$MainRsSrc = Join-Path $WorkingDir "src\lib.rs"
-$MainRsTarget = Join-Path $ProjectDir "src\lib.rs"
-
-if (Test-Path $MainRsRoot) { Copy-Item -Path $MainRsRoot -Destination $MainRsTarget -Force }
-elseif (Test-Path $MainRsSrc) { Copy-Item -Path $MainRsSrc -Destination $MainRsTarget -Force }
-else { Write-Host "`n$cRed[!] CRITICAL: 'lib.rs' not found. Please rename main.rs to lib.rs.$cReset"; Exit }
-
-# ============================================================================
-# 4. NATIVE VCVARS COMPILATION PIPELINE
+# 3. NATIVE VCVARS COMPILATION PIPELINE
 # ============================================================================
 Write-Host "    [*] Constructing Native MSVC Compilation Context..." -ForegroundColor Gray
 
@@ -191,9 +145,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # ============================================================================
-# 5. EXTRACTION & CLEANUP
+# 4. EXTRACTION & CLEANUP
 # ============================================================================
-$CompiledDll = Join-Path $ProjectDir "target\release\deep_sensor_ml.dll"
+$CompiledDll = Join-Path $WorkingDir "target\release\deep_sensor_ml.dll"
 $FinalDest = Join-Path $WorkingDir $FinalBinaryName
 
 if (Test-Path $CompiledDll) {
@@ -201,7 +155,7 @@ if (Test-Path $CompiledDll) {
     $HashVal = (Get-FileHash $FinalDest -Algorithm SHA256).Hash
     $HashDest = Join-Path $WorkingDir ($FinalBinaryName -replace "\.dll$", ".sha256")
     $HashVal | Out-File -FilePath $HashDest -Encoding ascii -NoNewline
-    Remove-Item $ProjectDir -Recurse -Force
+    Remove-Item (Join-Path $WorkingDir "target") -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $CompileWrapper -Force -ErrorAction SilentlyContinue
 
     $SizeMB = [math]::Round(((Get-Item $FinalDest).Length / 1MB), 2)

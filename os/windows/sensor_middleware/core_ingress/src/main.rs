@@ -9,7 +9,7 @@ use axum::{
 };
 use ini::Ini;
 use std::sync::Arc;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 
 struct AppState {
     js: async_nats::jetstream::Context,
@@ -72,7 +72,20 @@ async fn handle_telemetry(
     }
 
     // Publish to JetStream to ensure messages are persisted if workers are down
-    match state.js.publish(state.subject.clone(), body).await {
+    let sensor_type = headers
+        .get("X-Sensor-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let envelope = serde_json::json!({
+        "sensor_type": sensor_type,
+        "events": serde_json::from_slice::<serde_json::Value>(&body).unwrap_or(serde_json::Value::Null)
+    });
+
+    let enveloped_bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+
+    match state.js.publish(state.subject.clone(), enveloped_bytes.into()).await {
         Ok(_) => StatusCode::ACCEPTED,
         Err(e) => {
             error!("JetStream Publish Fault: {}", e);
