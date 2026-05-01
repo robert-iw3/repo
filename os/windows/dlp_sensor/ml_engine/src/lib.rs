@@ -414,7 +414,13 @@ pub extern "C" fn process_telemetry_batch(
 
     // --- UNIVERSAL GATEWAY DISPATCH ---
     for alert in &alerts {
-        if let Ok(json_val) = serde_json::to_value(alert) {
+        if let Ok(mut json_val) = serde_json::to_value(alert) {
+            if let Some(obj) = json_val.as_object_mut() {
+                obj.insert("timestamp".into(), json!(chrono::Utc::now().to_rfc3339()));
+                obj.insert("event_type".into(), json!(alert.alert_type.clone()));
+                obj.insert("bytes".into(), json!(0));
+                obj.insert("is_dlp_hit".into(), json!(true));
+            }
             let _ = engine.tx.try_send(json_val);
         }
     }
@@ -492,13 +498,19 @@ pub extern "C" fn scan_text_payload(
         };
 
         // --- UNIVERSAL GATEWAY DISPATCH ---
-        if let Ok(json_val) = serde_json::to_value(&alert) {
-            let _ = engine.tx.try_send(json_val);
-        }
-
+        for alert in &alerts {
+            if let Ok(mut json_val) = serde_json::to_value(alert) {
+                if let Some(obj) = json_val.as_object_mut() {
+                    obj.entry("timestamp").or_insert_with(|| json!(chrono::Utc::now().to_rfc3339()));
+                    obj.entry("event_type").or_insert_with(|| json!(&alert.alert_type));
+                    obj.entry("bytes").or_insert(json!(0));
+                    obj.entry("is_dlp_hit").or_insert(json!(true));
+                }
+             let _ = engine.tx.try_send(json_val);
+         }
+     }
         return serialize_response(vec![alert]);
     }
-
     std::ptr::null_mut()
 }
 
