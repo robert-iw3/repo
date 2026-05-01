@@ -256,6 +256,61 @@ Here is the breakdown of the sample ranges and the exact effect they have on the
 
 The baseline of **8** is the mathematically sound fulcrum. It forces the engine to wait just long enough to prove the connection isn't a random browser burst, but reacts fast enough to execute wire-speed threat mitigation before the adversary can pivot.
 
+#### Logging Flow
+```console
+=========================================================================================
+                       C2 SENSOR - LOGGING LOGIC
+=========================================================================================
+
+  [ ORIGIN A: Native Rust ]                   [ ORIGIN B: PowerShell ]
+  (K-Means, Fast-Flux, DGA)                   (AppGuard, JA3, Pipes)
+             |                                           |
+             |                                           v
+             |   (Writes copy for UI) --->  +-------------------------+
+             |                              | C2Sensor_Alerts.jsonl   |
+             |                              | (Local UI HUD Cache)    |
+             |                              | *Auto-deletes at 10MB*  |
+             |                              +-------------------------+
+             |                                           |
+             |                                           | (FFI Bridge Handoff)
+             v                                           v
+    +-------------------------------------------------------------------+
+    |                        c2sensor_ml.dll                            |
+    |                                                                   |
+    |  1. SQLite Persistence                                            |
+    |     +-------------------------------------------------------+     |
+    |     | C2Ledger (C2Sensor_State.db)                          |     |
+    |     | *The Permanent, Crash-Proof Master Audit Log*         |     |
+    |     +-------------------------------------------------------+     |
+    |                                                                   |
+    |  2. Memory Pipeline                                               |
+    |     +-------------------------------------------------------+     |
+    |     | Async Transmission Channel (mpsc::tx)                 |     |
+    |     +-------------------------------------------------------+     |
+    +-------------------------------------------------------------------+
+                               |
+                               v
+                 [ Async Transmission Worker ]
+                               |
+                +--------------+---------------+
+               /                                \
+      [ Network UP ]                     [ Network DOWN ]
+           |                                      |
+           v                                      v
++-----------------------+              +--------------------------+
+|   UNIVERSAL GATEWAY   |              | Transmission_DLQ.jsonl   |
+|     (Middleware)      | <---Drain--- | (Temporary Store & Fwd)  |
+|  *Forwards to SIEM*   |              | *Deletes upon drain*     |
++-----------------------+              +--------------------------+
+
+
+=========================================================================================
+                           OUT-OF-BAND DIAGNOSTICS
+=========================================================================================
+
+ [ Rust Panics / C# ETW Errors ] ----> C2Sensor_Diagnostic.log (Health Log)
+ ```
+
 ---
 
 ### Console Dashboard & Sensor HUD

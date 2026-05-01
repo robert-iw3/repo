@@ -826,6 +826,12 @@ $log2 = [Math]::Log(2)
 $Regex_NonDigit = [regex]::new('[^0-9]', 'Compiled')
 $vowels = [System.Collections.Generic.HashSet[char]]::new([char[]]"aeiou")
 
+function Write-EngineDiag([string]$Message, [string]$Level="INFO") {
+    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff")
+    Add-Content -Path $DiagLogPath -Value "[$ts] [$Level] $Message" -ErrorAction SilentlyContinue
+    if ($DebugMode) { Write-Host "[$Level] $Message" -ForegroundColor DarkGray }
+}
+
 function Write-Diag {
     param(
         [string]$Message,
@@ -1292,15 +1298,12 @@ function Invoke-ActiveDefense($ProcName, $DestIp, $Confidence, $Reason) {
         # Check if rule already exists (prevents bloat)
         $existingRule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
         if (-not $existingRule) {
-            netsh advfirewall firewall add rule `
-                name=$ruleName `
-                dir=out `
-                action=block `
-                remoteip=$DestIp `
-                protocol=any `
-                description="C2Sensor Auto-Block - Confidence $Confidence - $Reason" | Out-Null
 
-            $blockStatus = " | IP Blocked (new rule)"
+            # Execute mitigation asynchronously to prevent ETW loop starvation during aggressive attacks
+            $cmdArgs = "advfirewall firewall add rule name=$ruleName dir=out action=block remoteip=$DestIp protocol=any description=`"C2Sensor Auto-Block`""
+            Start-Process -FilePath "netsh" -ArgumentList $cmdArgs -WindowStyle Hidden -ErrorAction SilentlyContinue
+
+            $blockStatus = " | IP Blocked (Async Rule Executed)"
             $global:TotalMitigations++
         }
         else {
@@ -1388,6 +1391,29 @@ function Submit-SensorAlert {
     # 6. Immediate Active Defense
     if ($alertObj.Action -eq "Mitigated") {
         Invoke-ActiveDefense -ProcName $Image -DestIp $Destination -Confidence $Confidence -Reason $Flags
+    }
+
+    # 7. Unified Pipeline: Route ALL curated SIEM alerts to SQLite & Middleware via FFI
+    try {
+        $GatewayPayload = [ordered]@{
+            event_id     = $alertObj.EventID
+            timestamp    = $alertObj.Timestamp_UTC
+            host         = $alertObj.ComputerName
+            user         = $alertObj.SensorUser
+            host_ip      = $alertObj.HostIP
+            process      = $Image
+            destination  = $Destination
+            domain       = ""
+            alert_reason = $Flags
+            confidence   = $Confidence
+            event_type   = $Type
+            severity     = if ($Confidence -ge 95) { "CRITICAL" } elseif ($Confidence -ge 85) { "HIGH" } else { "MEDIUM" }
+            score        = $Confidence
+        } | ConvertTo-Json -Compress
+
+        [RealTimeC2Sensor]::TransmitAlertToGateway($GatewayPayload)
+    } catch {
+        Write-Diag "Failed to bridge orchestrator alert to FFI transmission gateway: $($_.Exception.Message)" "WARN"
     }
 }
 
@@ -1550,6 +1576,8 @@ Lock-SecureDirectory $BinPath
 Lock-SecureDirectory $DataPath
 Lockdown-ProjectDir
 
+Copy-Item -Path (Join-Path $ScriptDir "C2Sensor_Config.ini") -Destination "C:\ProgramData\C2Sensor\C2Sensor_Config.ini" -Force
+
 # 2. FFI Integrity Check and Relocation
 $dllSrc = Join-Path $ScriptDir "c2sensor_ml.dll"
 $hashSrc = Join-Path $ScriptDir "c2sensor_ml.sha256"
@@ -1635,14 +1663,14 @@ try {
 
                         Draw-AlertWindow
                     } else {
-                        Write-Diag $evt.Message "C#-ENGINE"
+                        Write-EngineDiag -Message $evt.Message -Level "ENGINE"
                     }
                     continue
                 }
 
                 $eventCount++
             if ($evt.Error) {
-                Write-Diag "FATAL ETW CRASH: $($evt.Error)" "ERROR"
+                Write-EngineDiag -Message "FATAL ETW CRASH: $($evt.Error)" -Level "FATAL"
                 Add-AlertMessage "FATAL ERROR: C# ETW THREAD CRASHED" $cRed
                 continue
             }
@@ -1972,7 +2000,7 @@ try {
                         $mlResults = $mlResponseString | ConvertFrom-Json -ErrorAction Stop
 
                         if ($mlResults.daemon_error) {
-                            Write-Diag "RUST ML ENGINE ERROR: $($mlResults.daemon_error)" "ERROR"
+                            Write-EngineDiag -Message "RUST ML ENGINE ERROR: $($mlResults.daemon_error)" -Level "ERROR"
                             Add-AlertMessage "ML ENGINE ERROR: $($mlResults.daemon_error)" $cRed
                         } elseif ($mlResults.alerts) {
                             foreach ($alert in $mlResults.alerts) {
@@ -2002,20 +2030,35 @@ try {
                                     }
                                 }
 
-                                $targetIp = "Unknown"; if ($alertKey -match "IP_([0-9\.]+)") { $targetIp = $matches[1] }
+                                $targetIp = "Unknown"
+                                if ($flowMetadata.ContainsKey($alertKey)) {
+                                    $ipArr = $flowMetadata[$alertKey].dst_ips.ToArray()
+                                    if ($ipArr.Length -gt 0) { $targetIp = $ipArr[-1] }
+
+                                    if ($flowMetadata[$alertKey].domain -and $flowMetadata[$alertKey].domain -ne $targetIp) {
+                                        $targetIp = $flowMetadata[$alertKey].domain
+                                    }
+                                } elseif ($alertKey -match "IP_([0-9\.]+)") {
+                                    $targetIp = $matches[1]
+                                }
+
                                 $portVal = "Unknown"; if ($alertKey -match "_Port_([0-9a-zA-Z_]+)") { $portVal = $matches[1] }
                                 $mlLearnKey = "ML_SUPPRESS|$resolvedImage|$targetIp|$portVal"
 
                                 if (-not $global:UebaLearningCache.ContainsKey($mlLearnKey)) {
                                     $global:UebaLearningCache[$mlLearnKey] = 0
                                 }
-                                $global:UebaLearningCache[$mlLearnKey]++
-                                $suppressHit = $global:UebaLearningCache[$mlLearnKey]
 
                                 $suppressFlag = $false
-                                if ($suppressHit -gt 5) {
-                                    $suppressFlag = $true
-                                    $alert.alert_reason = "[SUPPRESSED by UEBA Baseline] $($alert.alert_reason)"
+
+                                if ($alert.confidence -lt 90) {
+                                    $global:UebaLearningCache[$mlLearnKey]++
+                                    $suppressHit = $global:UebaLearningCache[$mlLearnKey]
+
+                                    if ($suppressHit -gt 5) {
+                                        $suppressFlag = $true
+                                        $alert.alert_reason = "[SUPPRESSED by UEBA Baseline] $($alert.alert_reason)"
+                                    }
                                 }
 
                                 $baseJson = "{}"
@@ -2078,12 +2121,17 @@ try {
             $lastMLRunTime = $now
         }
 
-        # --- LOG ROTATION & GROOMING ENGINE ---
+        # --- LOG ROTATION & GROOMING ENGINE (HUD CACHE ONLY) ---
         if ($dataBatch.Count -gt 0) {
-            if (Test-Path $OutputPath) {
-                if ((Get-Item $OutputPath).Length -gt 50MB) {
-                    $archiveName = $OutputPath.Replace(".jsonl", "_$($now.ToString('yyyyMMdd_HHmm')).jsonl")
-                    try { Move-Item -Path $OutputPath -Destination $archiveName -Force -ErrorAction Stop; Write-Diag "Alert log rotated." "INFO" } catch { Write-Diag "Alert log rotation failed: $($_.Exception.Message)" "WARN" }
+            if ($null -ne $OutputPath -and (Test-Path $OutputPath)) {
+                # Local jsonl is set to 10MB, and DELETE instead of Archive. The DLQ will hold data cached to be sent to the middleware -> SIEM.
+                if ((Get-Item $OutputPath).Length -gt 10MB) {
+                    try {
+                        Remove-Item -Path $OutputPath -Force -ErrorAction Stop
+                        Write-Diag "HUD Cache flushed (10MB threshold reached)." "INFO"
+                    } catch {
+                        Write-Diag "Failed to flush HUD cache: $($_.Exception.Message)" "WARN"
+                    }
                 }
             }
             $batchOutput = ($dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
@@ -2215,7 +2263,18 @@ try {
     } catch {}
 
     Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
-    try { [RealTimeC2Sensor]::StopSession() } catch {}
+    try {
+        if ($global:dataBatch.Count -gt 0 -and $null -ne $OutputPath) {
+            $batchOutput = ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
+            try { [System.IO.File]::AppendAllText($OutputPath, $batchOutput + "`r`n") } catch { }
+        }
+        if ($global:uebaBatch.Count -gt 0 -and $null -ne $UebaLogPath) {
+            $uebaOutput = $global:uebaBatch -join "`r`n"
+            try { [System.IO.File]::AppendAllText($UebaLogPath, $uebaOutput + "`r`n") } catch { }
+        }
+
+        [RealTimeC2Sensor]::StopSession()
+    } catch {}
     Write-Diag "C# TraceEvent Session Halted." "INFO"
 
     Write-Host "    [*] Cleaning up centralized library artifacts..." -ForegroundColor Gray

@@ -1,149 +1,250 @@
 <#
 .SYNOPSIS
-    C2 Beacon Sensor v1 - Rust Engine Compiler Pipeline
+    C2 Beacon Sensor — Rust Workspace Compiler Pipeline
 
 .DESCRIPTION
-    Compiles the native Rust Machine Learning engine into a C-Compatible Dynamic
-    Link Library (.dll). This allows the C# ETW sensor to map the engine directly
-    into memory via FFI, completely eliminating Python IPC pipe latency.
+    Compiles the C2Sensor Rust workspace into a native C-compatible DLL
+    (c2sensor_ml.dll) for direct FFI integration with the C# ETW orchestrator.
 
-@RW
+    The workspace contains two crates:
+      • ml_engine    — The behavioral ML engine (cdylib → c2sensor_ml.dll)
+      • transmission — Async telemetry pusher to the sensor middleware gateway
+
+    Pipeline:
+      1. Validates MSVC Desktop C++ Workload & Windows SDK (UCRT).
+      2. Validates the Rust stable toolchain (x86_64-pc-windows-msvc).
+      3. Initialises vcvars64 and runs `cargo build --release --workspace`.
+      4. Validates the compiled DLL, computes SHA-256, stages to project root.
+
+.PARAMETER Clean
+    When specified, runs `cargo clean` before building.
+
+.PARAMETER SkipToolchainCheck
+    Skips MSVC and Rust toolchain validation (for pre-provisioned CI images).
+
+.NOTES
+    Author : Robert Weber
+    Must be run as Administrator (MSVC installer requires elevation).
 #>
 #Requires -RunAsAdministrator
 
+[CmdletBinding()]
+param(
+    [switch]$Clean,
+    [switch]$SkipToolchainCheck
+)
+
 $ErrorActionPreference = 'Stop'
-$WorkingDir = $PWD.Path
-$ProjectName = "c2sensor_ml"
-$ProjectDir = Join-Path $WorkingDir $ProjectName
-$FinalBinaryName = "c2sensor_ml.dll"
 
-$ESC = [char]27
-$cRed = "$ESC[91m"; $cCyan = "$ESC[96m"; $cGreen = "$ESC[92m"; $cYellow = "$ESC[93m"; $cReset = "$ESC[0m"
+# ── Paths ──────────────────────────────────────────────────────────────────────
+$WorkingDir       = $PSScriptRoot   # Script lives in the workspace root
+$BinDir           = Join-Path $WorkingDir "target\release"
+$FinalBinaryName  = "c2sensor_ml.dll"
+$FinalDest        = Join-Path $WorkingDir $FinalBinaryName
 
-Write-Host "`n$cCyan[*] INITIATING C2 SENSOR RUST COMPILER PIPELINE (v1.0)$cReset"
+# ── ANSI colours ───────────────────────────────────────────────────────────────
+$ESC    = [char]27
+$cRed   = "$ESC[91m"
+$cGreen = "$ESC[92m"
+$cYellow= "$ESC[93m"
+$cCyan  = "$ESC[96m"
+$cGray  = "$ESC[90m"
+$cBold  = "$ESC[1m"
+$cReset = "$ESC[0m"
 
-# ============================================================================
-# 1. MSVC BUILD TOOLS VALIDATION
-# ============================================================================
-Write-Host "    [*] Verifying MSVC Desktop Workload & Universal C Runtime (UCRT)..." -ForegroundColor Gray
-$vsWherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsInstallPath = $null
-
-if (Test-Path $vsWherePath) {
-    $paths = & $vsWherePath -latest -products * -property installationPath
-    if ($paths) { if ($paths -is [array]) { $vsInstallPath = $paths[0] } else { $vsInstallPath = $paths } }
+function Write-Step {
+    param([string]$Phase, [string]$Message, [string]$Detail = "")
+    $stamp = "[{0:HH:mm:ss}]" -f (Get-Date)
+    Write-Host "$cCyan$stamp$cReset $cYellow[$Phase]$cReset $Message"
+    if ($Detail) { Write-Host "           $cGray$Detail$cReset" }
 }
 
-if ([string]::IsNullOrWhiteSpace($vsInstallPath)) {
-    $FallbackPaths = @("${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools", "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Community")
-    foreach ($fp in $FallbackPaths) {
-        if (Test-Path (Join-Path $fp "VC\Auxiliary\Build\vcvars64.bat")) { $vsInstallPath = $fp; break }
+Write-Host ""
+Write-Host "$cCyan$cBold╔══════════════════════════════════════════════════════════════╗$cReset"
+Write-Host "$cCyan$cBold║   C2 BEACON SENSOR — RUST WORKSPACE COMPILER PIPELINE       ║$cReset"
+Write-Host "$cCyan$cBold╚══════════════════════════════════════════════════════════════╝$cReset"
+Write-Host ""
+
+# ── Verify workspace structure ────────────────────────────────────────────────
+$wsCargoToml = Join-Path $WorkingDir "Cargo.toml"
+$mlEngineSrc = Join-Path $WorkingDir "ml_engine\src\lib.rs"
+$txSrc       = Join-Path $WorkingDir "transmission\src\lib.rs"
+
+if (-not (Test-Path $wsCargoToml)) {
+    Write-Host "$cRed[!] CRITICAL: Workspace Cargo.toml not found at $wsCargoToml$cReset"
+    Write-Host "    The build script must be run from the C2Sensor workspace root."
+    Exit 1
+}
+
+foreach ($required in @($mlEngineSrc, $txSrc)) {
+    if (-not (Test-Path $required)) {
+        Write-Host "$cRed[!] CRITICAL: Missing source file: $required$cReset"
+        Exit 1
+    }
+}
+Write-Step "VERIFY" "Workspace structure validated" "ml_engine + transmission"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1.  MSVC BUILD TOOLS VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+$vsInstallPath = $null
+
+if (-not $SkipToolchainCheck) {
+    Write-Step "MSVC" "Verifying MSVC Desktop Workload & Universal C Runtime..."
+
+    $vsWherePath = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vsWherePath) {
+        $paths = & $vsWherePath -latest -products * -property installationPath
+        if ($paths) {
+            $vsInstallPath = if ($paths -is [array]) { $paths[0] } else { $paths }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($vsInstallPath)) {
+        foreach ($fp in @(
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Community",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Professional",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise"
+        )) {
+            if (Test-Path (Join-Path $fp "VC\Auxiliary\Build\vcvars64.bat")) {
+                $vsInstallPath = $fp; break
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($vsInstallPath) -and (Test-Path $vsInstallPath)) {
+        Write-Host "  $cGreen[+]$cReset Visual Studio environment: $vsInstallPath"
+    } else {
+        Write-Host "`n$cRed[!] CRITICAL: MSVC Build Tools not found. Install the C++ Desktop Workload.$cReset"
+        Exit 1
+    }
+} else {
+    Write-Step "MSVC" "Skipped (SkipToolchainCheck)"
+    foreach ($fp in @(
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Community",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Professional",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Enterprise"
+    )) {
+        if (Test-Path (Join-Path $fp "VC\Auxiliary\Build\vcvars64.bat")) {
+            $vsInstallPath = $fp; break
+        }
     }
 }
 
-if (-not [string]::IsNullOrWhiteSpace($vsInstallPath) -and (Test-Path $vsInstallPath)) {
-    Write-Host "    $cGreen[+] Visual Studio environment located at: $vsInstallPath$cReset"
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2.  RUST TOOLCHAIN VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+if (-not $SkipToolchainCheck) {
+    Write-Step "RUST" "Verifying Rust toolchain (cargo)..."
+    try {
+        $null = Get-Command cargo -ErrorAction Stop
+        $rustVer = (& cargo --version 2>&1) -join ''
+        Write-Host "  $cGreen[+]$cReset $rustVer"
+    } catch {
+        Write-Host "`n$cRed[!] CRITICAL: Rust toolchain (cargo) not found in PATH.$cReset"
+        Exit 1
+    }
 } else {
-    Write-Host "`n$cRed[!] CRITICAL: MSVC Build Tools missing. Please install the C++ Desktop Workload.$cReset"; Exit
+    Write-Step "RUST" "Skipped (SkipToolchainCheck)"
 }
 
-# ============================================================================
-# 2. TOOLCHAIN VALIDATION
-# ============================================================================
-Write-Host "    [*] Verifying Rust Toolchain (Cargo)..." -ForegroundColor Gray
-try {
-    $null = Get-Command cargo -ErrorAction Stop
-    Write-Host "    $cGreen[+] Rust toolchain is installed and accessible.$cReset"
-} catch {
-    Write-Host "`n$cRed[!] CRITICAL: Rust toolchain (cargo) not found in PATH.$cReset"; Exit
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3.  NATIVE VCVARS COMPILATION
+# ═══════════════════════════════════════════════════════════════════════════════
+Write-Step "BUILD" "Constructing native MSVC compilation context..."
+
+$VcvarsPath = $null
+if (-not [string]::IsNullOrWhiteSpace($vsInstallPath)) {
+    $VcvarsPath = Join-Path $vsInstallPath "VC\Auxiliary\Build\vcvars64.bat"
 }
 
-# ============================================================================
-# 3. PROJECT SCAFFOLDING
-# ============================================================================
-Write-Host "    [*] Scaffolding Rust Library Architecture..." -ForegroundColor Gray
-if (Test-Path $ProjectDir) { Remove-Item $ProjectDir -Recurse -Force }
-New-Item -ItemType Directory -Path (Join-Path $ProjectDir "src") -Force | Out-Null
+$CleanLine = ""
+if ($Clean) { $CleanLine = "cargo clean" }
 
-$CargoTomlContent = @"
-[package]
-name = "c2sensor_ml"
-version = "1.0.0"
-edition = "2021"
-
-[lib]
-name = "c2sensor_ml"
-crate-type = ["cdylib"]
-
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = 'abort'
-strip = true
-
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rusqlite = { version = "0.31", features = ["bundled"] }
-linfa = "0.7"
-linfa-clustering = "0.7"
-linfa-nn = "0.7"
-ndarray = "0.15"
-rand = "0.8"
-regex = "1.10"
-"@
-Set-Content -Path (Join-Path $ProjectDir "Cargo.toml") -Value $CargoTomlContent
-
-$MainRsRoot = Join-Path $WorkingDir "lib.rs"
-$MainRsSrc = Join-Path $WorkingDir "src\lib.rs"
-$MainRsTarget = Join-Path $ProjectDir "src\lib.rs"
-
-if (Test-Path $MainRsRoot) { Copy-Item -Path $MainRsRoot -Destination $MainRsTarget -Force }
-elseif (Test-Path $MainRsSrc) { Copy-Item -Path $MainRsSrc -Destination $MainRsTarget -Force }
-else { Write-Host "`n$cRed[!] CRITICAL: 'lib.rs' not found.$cReset"; Exit }
-
-# ============================================================================
-# 4. NATIVE VCVARS COMPILATION PIPELINE
-# ============================================================================
-Write-Host "    [*] Constructing Native MSVC Compilation Context..." -ForegroundColor Gray
-
-$VcvarsPath = Join-Path $vsInstallPath "VC\Auxiliary\Build\vcvars64.bat"
-$CompileWrapper = Join-Path $ProjectDir "Invoke-NativeCompiler.cmd"
-$WrapperLogic = @"
+$CompileWrapper = Join-Path $WorkingDir "_build_temp.cmd"
+if ($VcvarsPath -and (Test-Path $VcvarsPath)) {
+    $WrapperLogic = @"
 @echo off
+echo     [*] Initializing MSVC x64 linkers and Windows SDK...
 call "$VcvarsPath" >nul 2>&1
-cd /d "$ProjectDir"
-cargo build --release
+if %ERRORLEVEL% NEQ 0 (
+    echo     [!] CRITICAL: vcvars64.bat failed.
+    exit /b %ERRORLEVEL%
+)
+echo     [*] MSVC environment mapped.
+cd /d "$WorkingDir"
+$CleanLine
+echo     [*] Executing cargo build --release --workspace...
+cargo build --release --workspace
 exit /b %ERRORLEVEL%
 "@
+} else {
+    Write-Host "  $cYellow[!]$cReset vcvars64.bat not found; building without MSVC env."
+    $WrapperLogic = @"
+@echo off
+cd /d "$WorkingDir"
+$CleanLine
+echo     [*] Executing cargo build --release --workspace...
+cargo build --release --workspace
+exit /b %ERRORLEVEL%
+"@
+}
+
 Set-Content -Path $CompileWrapper -Value $WrapperLogic
 
+$buildStart = Get-Date
 & cmd.exe /c $CompileWrapper
+$buildElapsed = (Get-Date) - $buildStart
 
-if ($LASTEXITCODE -ne 0) { Write-Host "`n$cRed[!] COMPILATION FAILED: Cargo returned exit code $LASTEXITCODE$cReset"; Exit }
+Remove-Item $CompileWrapper -Force -ErrorAction SilentlyContinue
 
-# ============================================================================
-# 5. EXTRACTION & CLEANUP
-# ============================================================================
-$CompiledDll = Join-Path $ProjectDir "target\release\c2sensor_ml.dll"
-$FinalDest = Join-Path $WorkingDir $FinalBinaryName
-
-if (Test-Path $CompiledDll) {
-    Copy-Item -Path $CompiledDll -Destination $FinalDest -Force
-
-    $HashVal = (Get-FileHash $FinalDest -Algorithm SHA256).Hash
-    $HashDest = Join-Path $WorkingDir ($FinalBinaryName -replace "\.dll$", ".sha256")
-    $HashVal | Out-File -FilePath $HashDest -Encoding ascii -NoNewline
-
-    Remove-Item $ProjectDir -Recurse -Force
-    Remove-Item $CompileWrapper -Force -ErrorAction SilentlyContinue
-
-    $SizeMB = [math]::Round(((Get-Item $FinalDest).Length / 1MB), 2)
-    Write-Host "`n$cCyan╔══════════════════════════════════════════════════════════════════════════╗$cReset"
-    Write-Host "$cCyan║$cReset $cGreen SUCCESS: Native C2 Engine Compiled Successfully"
-    Write-Host "$cCyan║$cReset  Target : $FinalBinaryName"
-    Write-Host "$cCyan║$cReset  SHA256 : $HashVal"
-    Write-Host "$cCyan║$cReset  Size   : $SizeMB MB"
-    Write-Host "$cCyan╚══════════════════════════════════════════════════════════════════════════╝$cReset"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "`n$cRed[!] COMPILATION FAILED: cargo returned exit code $LASTEXITCODE$cReset"
+    Exit 1
 }
+
+Write-Step "BUILD" "Compilation succeeded" "Elapsed: $($buildElapsed.ToString('mm\:ss'))"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4.  BINARY VALIDATION & STAGING
+# ═══════════════════════════════════════════════════════════════════════════════
+Write-Step "VERIFY" "Validating compiled binary..."
+
+$CompiledDll = Join-Path $BinDir $FinalBinaryName
+
+if (-not (Test-Path $CompiledDll)) {
+    Write-Host "$cRed[!] CRITICAL: Expected DLL not found at $CompiledDll$cReset"
+    Write-Host "    Check that ml_engine/Cargo.toml [lib] name = 'c2sensor_ml' and crate-type = ['cdylib']"
+    Exit 1
+}
+
+Copy-Item -Path $CompiledDll -Destination $FinalDest -Force
+
+$HashVal = (Get-FileHash $FinalDest -Algorithm SHA256).Hash
+$HashFile = Join-Path $WorkingDir ($FinalBinaryName -replace "\.dll$", ".sha256")
+$HashVal | Out-File -FilePath $HashFile -Encoding ascii -NoNewline
+
+$SizeMB = [math]::Round(((Get-Item $FinalDest).Length / 1MB), 2)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5.  BUILD ARTIFACT CLEANUP
+$TargetDir = Join-Path $WorkingDir "target"
+if (Test-Path $TargetDir) {
+    Write-Step "CLEANUP" "Removing build artifacts" $TargetDir
+    Remove-Item $TargetDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ""
+Write-Host "$cCyan$cBold╔══════════════════════════════════════════════════════════════╗$cReset"
+Write-Host "$cCyan║$cReset $cGreen SUCCESS: C2 Sensor ML Engine Compiled$cReset"
+Write-Host "$cCyan║$cReset"
+Write-Host "$cCyan║$cReset   Binary  : $FinalBinaryName"
+Write-Host "$cCyan║$cReset   Size    : $SizeMB MB"
+Write-Host "$cCyan║$cReset   SHA-256 : $HashVal"
+Write-Host "$cCyan║$cReset   Staged  : $FinalDest"
+Write-Host "$cCyan║$cReset   Hash    : $HashFile"
+Write-Host "$cCyan║$cReset   Elapsed : $($buildElapsed.ToString('mm\:ss'))"
+Write-Host "$cCyan$cBold╚══════════════════════════════════════════════════════════════╝$cReset"
+Write-Host ""

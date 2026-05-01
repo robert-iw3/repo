@@ -37,7 +37,7 @@ public class RealTimeC2Sensor {
     private static int _lastEventsLost = 0;
 
     [DllImport("c2sensor_ml.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-    private static extern IntPtr init_engine();
+    private static extern IntPtr init_engine(IntPtr logCallback);
 
     [DllImport("c2sensor_ml.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
     private static extern IntPtr evaluate_telemetry(IntPtr engine, string jsonPayload);
@@ -51,7 +51,20 @@ public class RealTimeC2Sensor {
     [DllImport("c2sensor_ml.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern void teardown_engine(IntPtr engine);
 
+    [DllImport("c2sensor_ml.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    private static extern void submit_orchestrator_alert(IntPtr engine, string jsonPayload);
+
     private static IntPtr _mlEnginePtr = IntPtr.Zero;
+
+    public static void TransmitAlertToGateway(string jsonPayload) {
+        if (_mlEnginePtr != IntPtr.Zero && !string.IsNullOrEmpty(jsonPayload)) {
+            try {
+                submit_orchestrator_alert(_mlEnginePtr, jsonPayload);
+            } catch (Exception ex) {
+                EventQueue.Enqueue(new C2Event { Provider = "DiagLog", Message = $"FFI TX ERROR: {ex.Message}" });
+            }
+        }
+    }
 
     // --- NATIVE CLR OBJECT BINDING ---
     public class C2Event {
@@ -77,6 +90,19 @@ public class RealTimeC2Sensor {
         public string SuspiciousFlags { get; set; }
         public string RawJson { get; set; }
         public string Error { get; set; }
+    }
+
+    // Logging
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+    public delegate void RustLogCallback(IntPtr messagePtr);
+
+    private static RustLogCallback _rustLogger = new RustLogCallback(OnRustLog);
+
+    private static void OnRustLog(IntPtr messagePtr) {
+        if (messagePtr != IntPtr.Zero) {
+            string msg = Marshal.PtrToStringAnsi(messagePtr);
+            EventQueue.Enqueue(new C2Event { Provider = "DiagLog", Message = msg });
+        }
     }
 
     // Thread-safe queue passing strongly-typed objects instead of strings
@@ -164,7 +190,8 @@ public class RealTimeC2Sensor {
         SetDllDirectory(@"C:\ProgramData\C2Sensor\Bin");
 
         try {
-            _mlEnginePtr = init_engine();
+            IntPtr callbackPtr = Marshal.GetFunctionPointerForDelegate(_rustLogger);
+            _mlEnginePtr = init_engine(callbackPtr);
             if (_mlEnginePtr != IntPtr.Zero) {
                 EventQueue.Enqueue(new C2Event { Provider = "DiagLog", Message = "[ML ENGINE] Native DLL successfully mapped at memory address: 0x" });
             } else {
