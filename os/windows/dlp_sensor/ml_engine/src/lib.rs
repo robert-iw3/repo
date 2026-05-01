@@ -20,7 +20,7 @@ use std::time::Instant;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use serde_json::{json, Value};
+use serde_json::json;
 
 // --- LOGGING ---
 
@@ -498,17 +498,15 @@ pub extern "C" fn scan_text_payload(
         };
 
         // --- UNIVERSAL GATEWAY DISPATCH ---
-        for alert in &alerts {
-            if let Ok(mut json_val) = serde_json::to_value(alert) {
-                if let Some(obj) = json_val.as_object_mut() {
-                    obj.entry("timestamp").or_insert_with(|| json!(chrono::Utc::now().to_rfc3339()));
-                    obj.entry("event_type").or_insert_with(|| json!(&alert.alert_type));
-                    obj.entry("bytes").or_insert(json!(0));
-                    obj.entry("is_dlp_hit").or_insert(json!(true));
-                }
-             let _ = engine.tx.try_send(json_val);
-         }
-     }
+        if let Ok(mut json_val) = serde_json::to_value(&alert) {
+            if let Some(obj) = json_val.as_object_mut() {
+                obj.entry("timestamp").or_insert_with(|| serde_json::json!(chrono::Utc::now().to_rfc3339()));
+                obj.entry("event_type").or_insert_with(|| serde_json::json!(&alert.alert_type));
+                obj.entry("bytes").or_insert(serde_json::json!(text.len() as i64)); 
+                obj.entry("is_dlp_hit").or_insert(serde_json::json!(true));
+            }
+            let _ = engine.tx.try_send(json_val);
+        }
         return serialize_response(vec![alert]);
     }
     std::ptr::null_mut()

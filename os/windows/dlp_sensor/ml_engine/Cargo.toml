@@ -6,7 +6,6 @@ authors = ["Robert Weber"]
 description = "Native FFI UEBA & Content Inspection Engine"
 
 [lib]
-name = "deep_sensor_ml"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -20,3 +19,4 @@ hex = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 extended-isolation-forest = "0.2"
 chrono = "0.4"
+lru = "0.12.0"
