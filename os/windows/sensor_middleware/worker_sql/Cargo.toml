@@ -4,11 +4,14 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full", "net"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-tiberius = { version = "0.12", features = ["rustls", "integrated-auth-sspi"] }
+tokio            = { version = "1",    features = ["full", "net"] }
+tokio-util       = { version = "0.7",  features = ["compat"] }
+tiberius         = { version = "0.12", features = ["rustls", "integrated-auth-sspi"] }
 lib_siem_template = { path = "../lib_siem_template" }
-rust-ini = "0.21"
-async-trait = "0.1"
-tracing = "0.1"
+rust-ini         = "0.21"
+async-trait      = "0.1"
+tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+serde_json       = "1.0"
+# Required for TestWebhookUrl mode (HTTP mock target during QA)
+reqwest          = { version = "0.11", features = ["rustls-tls"], default-features = false }

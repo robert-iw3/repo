@@ -4,11 +4,13 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio            = { version = "1",    features = ["full"] }
 lib_siem_template = { path = "../lib_siem_template" }
-rust-ini = "0.21"
-reqwest = { version = "0.11", features = ["rustls-tls"], default-features = false }
-async-trait = "0.1"
-tracing = "0.1"
+rust-ini         = "0.21"
+reqwest          = { version = "0.11", features = ["rustls-tls"], default-features = false }
+async-trait      = "0.1"
+tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-serde_json = "1.0"
+serde_json       = "1.0"
+# BUG FIXED: chrono was used in main.rs (Utc::now()) but never declared here.
+chrono           = { version = "0.4", features = ["clock"] }
