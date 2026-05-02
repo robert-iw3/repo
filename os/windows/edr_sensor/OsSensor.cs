@@ -117,6 +117,99 @@ public class DeepVisibilitySensor {
         Exact
     }
 
+    public struct PendingSigmaEvent {
+        public string Category;
+        public int ProcessID;
+        public int ParentID;
+        public int ThreadID;
+        public string Image;
+        public string ParentImage;
+        public string Path;
+        public string Cmd;
+        public string FullReg;
+        public string DestIp;
+        public int DestPort;
+    }
+
+    // Dynamic bound, injected by PowerShell prior to engine initialization. Defaults to 20k.
+    public static int MaxSigmaQueueSize = 20000;
+    private static BlockingCollection<PendingSigmaEvent> _sigmaEvalQueue;
+
+    public static void StartSigmaEvaluator() {
+        Task.Run(() => {
+            foreach (var evt in _sigmaEvalQueue.GetConsumingEnumerable(_mlCancelSource.Token)) {
+                try {
+                    var matrix = _activeMatrix;
+                    List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
+
+                    if (evt.Category == "Process_Creation" && matrix.ProcRules != null) {
+                        for (int i = 0; i < matrix.ProcRules.Length; i++) {
+                            if (EvaluateSigmaRule(matrix.ProcRules[i], evt.Cmd, evt.Path, evt.Image, evt.ParentImage, "")) matchedSigmaRules.Add(matrix.ProcRules[i]);
+                        }
+                    } else if (evt.Category == "File_Event" && matrix.FileRules != null) {
+                        for (int i = 0; i < matrix.FileRules.Length; i++) {
+                            if (EvaluateSigmaRule(matrix.FileRules[i], "", evt.Path, evt.Image, "", "")) matchedSigmaRules.Add(matrix.FileRules[i]);
+                        }
+                    } else if (evt.Category == "Registry_Event" && matrix.RegRules != null) {
+                        for (int i = 0; i < matrix.RegRules.Length; i++) {
+                            if (EvaluateSigmaRule(matrix.RegRules[i], "", "", evt.Image, "", evt.FullReg)) matchedSigmaRules.Add(matrix.RegRules[i]);
+                        }
+                    } else if (evt.Category == "Image_Load" && matrix.ImgRules != null) {
+                        for (int i = 0; i < matrix.ImgRules.Length; i++) {
+                            if (EvaluateSigmaRule(matrix.ImgRules[i], "", evt.Path, evt.Image, "", "")) matchedSigmaRules.Add(matrix.ImgRules[i]);
+                        }
+                    } else if (evt.Category == "Network_Connection" && matrix.NetRules != null) {
+                        for (int i = 0; i < matrix.NetRules.Length; i++) {
+                            if (EvaluateSigmaRule(matrix.NetRules[i], evt.DestIp, evt.DestPort.ToString(), evt.Image, "", "")) matchedSigmaRules.Add(matrix.NetRules[i]);
+                        }
+                    }
+
+                    foreach (var mRule in matchedSigmaRules) {
+                        string cacheRuleName = mRule.id;
+                        int bracketIdx = cacheRuleName.IndexOf('[');
+                        if (bracketIdx >= 0) cacheRuleName = cacheRuleName.Substring(0, bracketIdx).Trim();
+                        string cacheKey = $"{evt.Image}|{cacheRuleName}";
+
+                        if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
+                            // ACTIVE THREAT DETECTED
+                            int score = ScoreAlert(mRule.severity, evt.Image, evt.ParentImage, evt.ProcessID, false);
+                            ResponseTier tier = TierFromScore(score);
+                            RecordTier(tier);
+
+                            if (tier >= ResponseTier.Alert) {
+                                EnqueueAlert("Sigma_Match", evt.Category, evt.Image, evt.ParentImage, evt.ProcessID, evt.ParentID, evt.ThreadID, evt.Cmd, evt.FullReg, mRule.title, mRule.title, mRule.severity, mRule.tags);
+                            }
+                            if (tier >= ResponseTier.Investigate && !string.IsNullOrEmpty(evt.Path)) {
+                                RequestYaraScan(evt.Path, $"{evt.Category}_Sigma", tier);
+                            }
+                            SuppressProcessRule(evt.Image, cacheRuleName);
+                        } else {
+                            // RULE SUPPRESSED - FEEDING UEBA BASELINE
+                            string uebaCmd = evt.Cmd ?? "";
+                            string uebaPath = evt.Path ?? "";
+
+                            if (evt.Category == "Registry_Event") {
+                                uebaCmd = evt.FullReg;
+                                uebaPath = evt.FullReg;
+                            } else if (evt.Category == "Network_Connection") {
+                                uebaCmd = evt.DestIp;
+                                uebaPath = evt.DestPort.ToString();
+                            } else if (string.IsNullOrEmpty(uebaCmd)) {
+                                uebaCmd = uebaPath; // Provide fallback for File/Image events
+                            }
+
+                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", evt.Image, evt.ParentImage ?? "", evt.ProcessID, evt.ParentID, evt.ThreadID, evt.Cmd ?? "", "", evt.Path ?? "", mRule.id, "", mRule.title, mRule.severity, mRule.tags, evt.DestIp ?? "", evt.DestPort);
+
+                            if (jsonEvent != null && _aggregator != null) {
+                                _aggregator.AddEvent(jsonEvent, evt.ParentImage ?? "", evt.Image, "Suppressed_Rule_Hit", mRule.id, uebaCmd, uebaPath, evt.ThreadID, GetEventUser(evt.ProcessID), mRule.title, "", "", "", mRule.severity);
+                            }
+                        }
+                    }
+                } catch (Exception ex) { EnqueueDiag($"[SIGMA EVALUATOR] Error: {ex.Message}"); }
+            }
+        }, _mlCancelSource.Token);
+    }
+
     public static void InitializePathMap() {
         try {
             foreach (var drive in Environment.GetLogicalDrives()) {
@@ -1387,6 +1480,7 @@ public class DeepVisibilitySensor {
     private static string _dllPath;
 
     public static void Initialize(string dllPath, int currentPid, string[] tiDrivers, string[] benignExplorerValues, string[] benignADSProcs) {
+        _sigmaEvalQueue = new BlockingCollection<PendingSigmaEvent>(new ConcurrentQueue<PendingSigmaEvent>(), MaxSigmaQueueSize);
         _dllPath = dllPath;
         SensorPid = currentPid;
         HostComputerName = JsonEscape(Environment.MachineName);
@@ -1552,6 +1646,7 @@ public class DeepVisibilitySensor {
                 }
             }
         }, _mlCancelSource.Token);
+        StartSigmaEvaluator();
     }
 
     public static void UpdateThreatIntel(string[] tiDrivers) {
@@ -1993,34 +2088,21 @@ public class DeepVisibilitySensor {
                 }
 
                 if (!ttpMatched) {
-                    List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
                     string parentName = GetProcessName(data.ParentID);
-
                     string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
                     string sigmaParent = parentName.StartsWith("\\") ? parentName : "\\" + parentName;
-                    for (int i = 0; i < matrix.ProcRules.Length; i++) {
-                        var rule = matrix.ProcRules[i];
-                        if (EvaluateSigmaRule(rule, cmd, path, sigmaImage, sigmaParent, "")) {
-                            matchedSigmaRules.Add(rule);
-                        }
-                    }
 
-                    foreach (var mRule in matchedSigmaRules) {
-                        string cacheRuleName = mRule.id;
-                        int bracketIdx = cacheRuleName.IndexOf('[');
-                        if (bracketIdx >= 0) cacheRuleName = cacheRuleName.Substring(0, bracketIdx).Trim();
-                        string cacheKey = $"{image}|{cacheRuleName}";
-
-                        if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "Process_Creation", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
-                            SuppressProcessRule(image, cacheRuleName);
-                        } else {
-                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
-
-                            if (jsonEvent != null && _aggregator != null) {
-                                _aggregator.AddEvent(jsonEvent, parentName, image, "Suppressed_Rule_Hit", mRule.id, cmd, path, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
-                            }
-                        }
+                    if (!_sigmaEvalQueue.IsAddingCompleted) {
+                        _sigmaEvalQueue.TryAdd(new PendingSigmaEvent {
+                            Category = "Process_Creation",
+                            ProcessID = data.ProcessID,
+                            ParentID = data.ParentID,
+                            ThreadID = data.ThreadID,
+                            Image = sigmaImage,
+                            ParentImage = sigmaParent,
+                            Path = path,
+                            Cmd = cmd
+                        });
                     }
                 }
                 EnqueueRaw("ProcessStart", image, GetProcessName(data.ParentID), "", cmd, data.ProcessID, data.ThreadID);
@@ -2037,8 +2119,11 @@ public class DeepVisibilitySensor {
 
         _session.Source.Kernel.RegistrySetValue += delegate (RegistryTraceData data) {
             try {
-                string image = GetProcessName(data.ProcessID);
                 if (data.ProcessID == SensorPid) return;
+                string image = GetProcessName(data.ProcessID);
+
+                // FAST-PATH BYPASS: Prevent ETW saturation by dropping trusted noise instantly
+                if (ProcessTrustClass.TryGetValue(image, out int trust) && trust >= 2) return;
 
                 string keyName = data.KeyName ?? "";
                 string valName = data.ValueName ?? "";
@@ -2095,32 +2180,15 @@ public class DeepVisibilitySensor {
                 }
 
                 if (!ttpMatched) {
-                    List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
-
                     string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
-                    for (int i = 0; i < matrix.RegRules.Length; i++) {
-                        var rule = matrix.RegRules[i];
-                        if (EvaluateSigmaRule(rule, "", "", sigmaImage, "", fullReg)) {
-                            matchedSigmaRules.Add(rule);
-                        }
-                    }
-
-                    foreach (var mRule in matchedSigmaRules) {
-                        string cacheRuleName = mRule.id;
-                        int bracketIdx = cacheRuleName.IndexOf('[');
-                        if (bracketIdx >= 0) cacheRuleName = cacheRuleName.Substring(0, bracketIdx).Trim();
-                        string cacheKey = $"{image}|{cacheRuleName}";
-
-                        if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "Registry_Event", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
-                            SuppressProcessRule(image, cacheRuleName);
-                        } else {
-                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", fullReg, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
-
-                            if (jsonEvent != null && _aggregator != null) {
-                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, fullReg, fullReg, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
-                            }
-                        }
+                    if (!_sigmaEvalQueue.IsAddingCompleted) {
+                        _sigmaEvalQueue.TryAdd(new PendingSigmaEvent {
+                            Category = "Registry_Event",
+                            ProcessID = data.ProcessID,
+                            ThreadID = data.ThreadID,
+                            Image = sigmaImage,
+                            FullReg = fullReg
+                        });
                     }
                 }
                 EnqueueRaw("RegistryWrite", image, "Unknown", fullReg, "", data.ProcessID, data.ThreadID);
@@ -2129,8 +2197,11 @@ public class DeepVisibilitySensor {
 
         _session.Source.Kernel.FileIOCreate += delegate (FileIOCreateTraceData data) {
             try {
-                string image = GetProcessName(data.ProcessID);
                 if (data.ProcessID == SensorPid) return;
+                string image = GetProcessName(data.ProcessID);
+
+                // FAST-PATH BYPASS: Prevent ETW saturation by dropping trusted noise instantly
+                if (ProcessTrustClass.TryGetValue(image, out int trust) && trust >= 2) return;
 
                 string path = ResolveDosPath(data.FileName ?? "");
                 if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
@@ -2190,42 +2261,15 @@ public class DeepVisibilitySensor {
                 }
 
                 if (!ttpMatched) {
-                    List<SigmaRule> matchedSigmaRules = new List<SigmaRule>();
-
                     string sigmaImage = image.StartsWith("\\") ? image : "\\" + image;
-                    for (int i = 0; i < matrix.FileRules.Length; i++) {
-                        var rule = matrix.FileRules[i];
-                        if (EvaluateSigmaRule(rule, "", path, sigmaImage, "", "")) {
-                            matchedSigmaRules.Add(rule);
-                        }
-                    }
-
-                    foreach (var mRule in matchedSigmaRules) {
-                        string cacheRuleName = mRule.id;
-                        int bracketIdx = cacheRuleName.IndexOf('[');
-                        if (bracketIdx >= 0) cacheRuleName = cacheRuleName.Substring(0, bracketIdx).Trim();
-                        string cacheKey = $"{image}|{cacheRuleName}";
-
-                        if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            int score = ScoreAlert(mRule.severity, image, "", data.ProcessID, false);
-                            ResponseTier tier = TierFromScore(score);
-                            RecordTier(tier);
-                            EnqueueDiag($"[TIER] Score={score} Tier={tier} Actor={image} Rule={cacheRuleName}");
-
-                            if (tier >= ResponseTier.Alert) {
-                                EnqueueAlert("Sigma_Match", "File_Event", image, "", data.ProcessID, 0, data.ThreadID, path, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
-                            }
-                            if (tier >= ResponseTier.Investigate) {
-                                RequestYaraScan(path, "FileIOCreate_Sigma", tier);
-                            }
-                            SuppressProcessRule(image, cacheRuleName);
-                        } else {
-                            string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, path, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
-
-                            if (jsonEvent != null && _aggregator != null) {
-                                _aggregator.AddEvent(jsonEvent, "", image, "Suppressed_Rule_Hit", mRule.id, path, path, data.ThreadID, GetEventUser(data.ProcessID), mRule.title, "", "", "", mRule.severity);
-                            }
-                        }
+                    if (!_sigmaEvalQueue.IsAddingCompleted) {
+                        _sigmaEvalQueue.TryAdd(new PendingSigmaEvent {
+                            Category = "File_Event",
+                            ProcessID = data.ProcessID,
+                            ThreadID = data.ThreadID,
+                            Image = sigmaImage,
+                            Path = path
+                        });
                     }
                 }
                 EnqueueRaw("FileIOCreate", image, "Unknown", path, "", data.ProcessID, data.ThreadID);
@@ -2273,7 +2317,8 @@ public class DeepVisibilitySensor {
                 }
 
                 heartbeatCounter++;
-                if (heartbeatCounter >= 15) {
+                // Emit heartbeat every 60 seconds (6 loops) to safely satisfy the PS 120s watchdog
+                if (heartbeatCounter >= 6) {
                     EventQueue.Enqueue("{\"Provider\":\"HealthCheck\"}");
                     heartbeatCounter = 0;
                 }

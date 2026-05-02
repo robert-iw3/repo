@@ -76,6 +76,7 @@ param (
 # --- Clear Trace ---
 logman stop "NT Kernel Logger" -ets >$null 2>&1
 
+<#
 # --- Global Failsafe ---
 Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action {
     try {
@@ -85,14 +86,7 @@ Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEv
         }
     } catch {}
 }
-
-# Catch unexpected Console closures (if running interactively)
-[System.AppDomain]::CurrentDomain.add_ProcessExit({
-    try {
-        [DeepVisibilitySensor]::StopSession()
-        [DeepVisibilitySensor]::TeardownEngine()
-    } catch {}
-})
+#>
 
 # --- Headless State Exec ---
 if ($Background) {
@@ -137,8 +131,10 @@ $script:logBatch = [System.Collections.Generic.List[string]]::new()
 $script:uebaBatch = [System.Collections.Generic.List[string]]::new()
 $UebaLogPath = $LogPath -replace "DeepSensor_Events.jsonl", "DeepSensor_UEBA_Events.jsonl"
 
+# Cache for historical alerts
 $global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 $global:HistoricalSuppressions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$global:HistoricalAlertsPath = Join-Path "C:\ProgramData\DeepSensor\Data" "HistoricalAlerts.cache"
 
 $ScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
@@ -2265,6 +2261,11 @@ try {
     $SecureBinDir = Split-Path $ValidMlBinaryPath -Parent
     [DeepVisibilitySensor]::SetLibraryPath($SecureBinDir)
 
+    # Inject dynamic Engine tunings from INI
+    if ($IniConfig.ContainsKey("ENGINE") -and $null -ne $IniConfig["ENGINE"]["MaxSigmaQueueSize"]) {
+        [DeepVisibilitySensor]::MaxSigmaQueueSize = [int]$IniConfig["ENGINE"]["MaxSigmaQueueSize"]
+    }
+
     # Initialize the C# Engine with the 5 required core parameters
     [DeepVisibilitySensor]::Initialize(
         $ActualDllPath,
@@ -2865,8 +2866,9 @@ try {
                 if ($global:HistoricalAlerts.Count -gt 50000) {
                     Write-Diag "[MAINTENANCE] Historical Alerts matrix reached capacity. Flushing state." "INFO"
                     $global:HistoricalAlerts.Clear()
+                    # Only write on flush/clear to avoid constant 60s I/O churn
+                    try { $global:HistoricalAlerts | Out-File -FilePath $global:HistoricalAlertsPath -Encoding UTF8 -Force -ErrorAction Stop } catch {}
                 }
-                try { $global:HistoricalAlerts | Out-File -FilePath $HistoricalAlertsPath -Encoding UTF8 -Force -ErrorAction Stop } catch {}
             }
             if ($null -ne $global:HistoricalSuppressions -and $global:HistoricalSuppressions.Count -gt 50000) {
                 Write-Diag "[MAINTENANCE] Historical Suppressions matrix reached capacity. Flushing state." "INFO"
@@ -2892,7 +2894,11 @@ try {
         $tamperStatus = "Good"
 
         # 1. Did the background Watchdog flag a buffer exhaustion?
-        if ($jsonStr -match "SENSOR_BLINDING_DETECTED") { $tamperStatus = "BAD" }
+        if ($jsonStr -match "SENSOR_BLINDING_DETECTED:(\d+)") {
+            $tamperStatus = "BAD"
+            $droppedCount = $matches[1]
+            Submit-SensorAlert -Type "Telemetry_Gap" -TargetObject "ETW_Buffer" -Image "System" -Flags "Sensor blinded due to kernel buffer exhaustion. Dropped $droppedCount events." -Confidence 100 -IsSuppressed:$false
+        }
 
         # 2. Is the C# session still alive and responding to canaries?
         if (-not [DeepVisibilitySensor]::IsSessionHealthy() -or (($now - $LastHeartbeat).TotalSeconds -gt 120)) { $tamperStatus = "BAD" }
@@ -2983,9 +2989,9 @@ try {
 
     Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
     try {
-        if ($null -ne $global:dataBatch -and $global:dataBatch.Count -gt 0 -and $null -ne $global:LogFile) {
+        if ($null -ne $global:dataBatch -and $global:dataBatch.Count -gt 0 -and $null -ne $LogPath) {
             $batchOutput = ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
-            try { [System.IO.File]::AppendAllText($global:LogFile, $batchOutput + "`r`n") } catch { }
+            try { [System.IO.File]::AppendAllText($LogPath, $batchOutput + "`r`n") } catch { }
         }
 
         [DeepVisibilitySensor]::StopSession()
