@@ -31,11 +31,12 @@ public class DeepVisibilitySensor {
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetDllDirectory(string lpPathName);
 
-    [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-    private static extern IntPtr init_engine();
+    [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr init_engine(NativeLogCallback logCb);
 
-    [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
-    private static extern IntPtr evaluate_telemetry(IntPtr engine, string jsonPayload);
+    [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr evaluate_telemetry(IntPtr engine,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string jsonPayload);
 
     [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern void free_string(IntPtr ptr);
@@ -46,6 +47,10 @@ public class DeepVisibilitySensor {
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, uint ucchMax);
 
+    [DllImport("DeepSensor_ML_v2.1.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void submit_orchestrator_alert(IntPtr engine,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string jsonPayload);
+
     private static Dictionary<string, string> _deviceMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private static BlockingCollection<string> _mlWorkQueue = new BlockingCollection<string>(new ConcurrentQueue<string>(), 2000);
     private static CancellationTokenSource _mlCancelSource = new CancellationTokenSource();
@@ -53,10 +58,30 @@ public class DeepVisibilitySensor {
     private static Task _mlConsumerTask;
     public static int GetMlQueueDepth() => _mlWorkQueue.Count;
     public static int GetPowerShellQueueDepth() => EventQueue.Count;
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate void NativeLogCallback(IntPtr message);
+    private static NativeLogCallback _rustLoggerDelegate;
+    private static ConcurrentQueue<string> _alertOutbox = new ConcurrentQueue<string>();
+    private static BlockingCollection<int> _userResolveQueue = new BlockingCollection<int>(new ConcurrentQueue<int>(), 2000);
+    private static int _userResolverStarted = 0;
 
     private static void EnqueueDiag(string msg) {
         string ts = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
         EventQueue.Enqueue($"{{\"Provider\":\"DiagLog\", \"Timestamp\":\"{ts}\", \"Message\":\"{JsonEscape(msg)}\"}}");
+    }
+
+    public static void TransmitAlertToGateway(string payload) {
+        if (_mlEnginePtr != IntPtr.Zero && !string.IsNullOrEmpty(payload)) {
+            submit_orchestrator_alert(_mlEnginePtr, payload);
+        }
+    }
+
+    public static void InitializeEngine() {
+        _rustLoggerDelegate = new NativeLogCallback(msgPtr => {
+            string msg = Marshal.PtrToStringAnsi(msgPtr);
+            EnqueueDiag($"[RUST] {msg}");
+        });
+        _mlEnginePtr = init_engine(_rustLoggerDelegate);
     }
 
     public static long TotalEventsParsed = 0;
@@ -259,7 +284,9 @@ public class DeepVisibilitySensor {
         if (_mlEnginePtr == IntPtr.Zero || _mlWorkQueue == null) return;
         try {
             if (!_mlWorkQueue.IsAddingCompleted) {
-                _mlWorkQueue.Add(jsonEvent);
+                if (!_mlWorkQueue.TryAdd(jsonEvent, 10)) {
+                    EnqueueDiag("[INJECT UEBA] ML queue saturated; dropped injected event.");
+                }
             }
         } catch (InvalidOperationException) { /* Prevents Orchestrator Fatal Crashes */ }
     }
@@ -323,7 +350,7 @@ public class DeepVisibilitySensor {
                         FlushBucket(key, b, b.OriginalJson);
                     }
                 }
-            } catch { /* fail open */ }
+            } catch (Exception ex) { EnqueueDiag($"[UEBA AGGREGATOR ERROR] Event buffering failed: {ex.Message}"); }
         }
 
         private void FlushBucket(string key, AggregateBucket b, string originalJson) {
@@ -358,8 +385,11 @@ public class DeepVisibilitySensor {
                 ""EventUser"":""{JsonEscape(b.EventUser)}""
             }}".Replace("\r", "").Replace("\n", "").Replace("  ", "");
 
-            if (_mlEnginePtr != IntPtr.Zero && !_mlWorkQueue.IsAddingCompleted)
-                _mlWorkQueue.Add(json);
+            if (_mlEnginePtr != IntPtr.Zero && !_mlWorkQueue.IsAddingCompleted) {
+                if (!_mlWorkQueue.TryAdd(json, 10)) {
+                    EnqueueDiag("[UEBA ERROR] ML Work Queue full. Dropped aggregated UEBA batch to prevent thread deadlock.");
+                }
+            }
         }
     }
 
@@ -386,9 +416,60 @@ public class DeepVisibilitySensor {
     private static TraceEventSession _session;
     private static Thread _umThread;
     public static bool IsArmed = false;
-    private static BlockingCollection<string> _yaraScanQueue = new BlockingCollection<string>();
+    private static BlockingCollection<string> _yaraScanQueue = new BlockingCollection<string>(new ConcurrentQueue<string>(), 2000);
     private static CancellationTokenSource _yaraCts = new CancellationTokenSource();
     private static readonly object _yaraLock = new object();
+    public static ConcurrentDictionary<string, byte> YaraScanExcludedPaths =
+        new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+
+    // ---- Armed-mode response tiering ----
+    // Configured at startup by the launcher from [ArmedMode] config section.
+    // Score thresholds gate which active-defense actions fire. See config.ini
+    // for vocabulary. All defaults are conservative (action only on high score).
+    public static int Tier1Threshold = 40;
+    public static int Tier2Threshold = 70;
+    public static int Tier3Threshold = 90;
+
+    // Process-name -> trust class lookup, populated at startup. Reuses
+    // BenignADSProcs / TrustedNoise lists from [ProcessExclusions].
+    //   0 = Hostile (default)  +TrustHostileDelta
+    //   1 = Unknown
+    //   2 = Trusted (TrustedNoise)
+    //   3 = Benign (BenignADSProcs)
+    public static ConcurrentDictionary<string, int> ProcessTrustClass =
+        new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+    // Severity-string -> score contribution.
+    public static ConcurrentDictionary<string, int> SeverityWeights =
+        new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+    // Score-delta config knobs (settable from launcher).
+    public static int TrustBenignDelta       = -100;
+    public static int TrustTrustedDelta      = -60;
+    public static int TrustUnknownDelta      = 0;
+    public static int TrustHostileDelta      = 50;
+    public static int LineageBenignDelta     = -80;
+    public static int YaraHitDelta           = 100;
+    public static int RepeatActorPerAlertDelta = 15;
+    public static int MaxRepeatAlertsConsidered = 6;
+
+    // Per-actor (PID) recent-alert tally. Sliding 5-min window. Lock-free.
+    private struct ActorTally { public int Count; public long FirstTicks; }
+    private static ConcurrentDictionary<int, ActorTally> _actorRecentAlerts =
+        new ConcurrentDictionary<int, ActorTally>();
+    private const long _actorWindowTicks = 3_000_000_000L; // 5 min in 100ns ticks
+
+    // Tier counters for telemetry / regression.
+    public static long TotalAlertsTier0Suppressed = 0;
+    public static long TotalAlertsTier1 = 0;
+    public static long TotalAlertsTier2 = 0;
+    public static long TotalAlertsTier3 = 0;
+
+    // Rate-limiting state for [YARA QUEUE FULL] log lines — emit at most one summary
+    private static long _yaraQueueFullLastLogTicks = 0L;
+    private static int  _yaraQueueFullDropCount    = 0;
+    private const  long _yaraQueueFullWindowTicks  = 50_000_000L;
+
     private static ConcurrentDictionary<int, string> ProcessCache = new ConcurrentDictionary<int, string>();
     private static ConcurrentDictionary<int, DateTime> ProcessStartTime = new ConcurrentDictionary<int, DateTime>();
     private static ConcurrentDictionary<int, string> ProcessUserCache = new ConcurrentDictionary<int, string>();
@@ -488,6 +569,163 @@ public class DeepVisibilitySensor {
         }
     }
 
+    private static bool IsYaraScanExcluded(string path) {
+        if (YaraScanExcludedPaths.IsEmpty) return false;
+        foreach (var kvp in YaraScanExcludedPaths) {
+            if (path.IndexOf(kvp.Key, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+        }
+        return false;
+    }
+
+    // Rate-limited [YARA QUEUE FULL] reporter. At most one EnqueueDiag per ~5s
+    // regardless of incoming event rate. Lock-free via Interlocked CAS.
+    private static void ThrottleYaraQueueFullLog(string path) {
+        Interlocked.Increment(ref _yaraQueueFullDropCount);
+        long nowTicks  = DateTime.UtcNow.Ticks;
+        long lastTicks = Interlocked.Read(ref _yaraQueueFullLastLogTicks);
+        if (nowTicks - lastTicks >= _yaraQueueFullWindowTicks &&
+            Interlocked.CompareExchange(ref _yaraQueueFullLastLogTicks, nowTicks, lastTicks) == lastTicks) {
+            int cnt = Interlocked.Exchange(ref _yaraQueueFullDropCount, 0);
+            EnqueueDiag($"[YARA QUEUE FULL] {cnt} scan(s) suppressed in ~5s window. Last path: {path}");
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Confidence scoring + response tiering
+    // ----------------------------------------------------------------------
+
+    public enum ResponseTier { Telemetry = 0, Alert = 1, Investigate = 2, Respond = 3 }
+
+    public static int ScoreAlert(
+        string ruleSeverity,
+        string actorProcess,
+        string parentProcess,
+        int actorPid,
+        bool yaraConfirmed)
+    {
+        int score = 0;
+
+        // 1. Rule severity
+        int sevWeight;
+        if (!string.IsNullOrEmpty(ruleSeverity) &&
+            SeverityWeights.TryGetValue(ruleSeverity, out sevWeight)) {
+            score += sevWeight;
+        }
+
+        // 2. Process trust class. Default to "Unknown" if not classified.
+        int trustClass;
+        if (string.IsNullOrEmpty(actorProcess) ||
+            !ProcessTrustClass.TryGetValue(actorProcess, out trustClass)) {
+            trustClass = 1; // Unknown
+        }
+        switch (trustClass) {
+            case 3: score += TrustBenignDelta;   break;
+            case 2: score += TrustTrustedDelta;  break;
+            case 1: score += TrustUnknownDelta;  break;
+            default: score += TrustHostileDelta; break;
+        }
+
+        // 3. Lineage trust
+        if (!string.IsNullOrEmpty(parentProcess) && !string.IsNullOrEmpty(actorProcess)) {
+            string lineageKey = parentProcess + "|" + actorProcess;
+            if (BenignLineages.ContainsKey(lineageKey)) {
+                score += LineageBenignDelta;
+            }
+        }
+
+        // 4. YARA confirmation (binary, large-weight)
+        if (yaraConfirmed) {
+            score += YaraHitDelta;
+        }
+
+        // 5. Repeat-actor escalation
+        if (actorPid > 0) {
+            score += GetRepeatActorScoreDelta(actorPid);
+        }
+
+        if (score < 0)   score = 0;
+        if (score > 100) score = 100;
+        return score;
+    }
+
+    public static ResponseTier TierFromScore(int score) {
+        if (score >= Tier3Threshold) return ResponseTier.Respond;
+        if (score >= Tier2Threshold) return ResponseTier.Investigate;
+        if (score >= Tier1Threshold) return ResponseTier.Alert;
+        return ResponseTier.Telemetry;
+    }
+
+    private static int GetRepeatActorScoreDelta(int pid) {
+        long nowTicks = DateTime.UtcNow.Ticks;
+        var fresh = new ActorTally { Count = 1, FirstTicks = nowTicks };
+
+        ActorTally cur;
+        if (_actorRecentAlerts.TryGetValue(pid, out cur)) {
+            if (nowTicks - cur.FirstTicks > _actorWindowTicks) {
+                _actorRecentAlerts[pid] = fresh;
+                return 0;
+            }
+            cur.Count += 1;
+            _actorRecentAlerts[pid] = cur;
+        } else {
+            _actorRecentAlerts[pid] = fresh;
+            cur = fresh;
+        }
+
+        // First alert == 0 delta; each additional contributes RepeatActorPerAlertDelta
+        // up to MaxRepeatAlertsConsidered.
+        int extra = cur.Count - 1;
+        if (extra <= 0) return 0;
+        if (extra > MaxRepeatAlertsConsidered) extra = MaxRepeatAlertsConsidered;
+        return extra * RepeatActorPerAlertDelta;
+    }
+
+    private static void RecordTier(ResponseTier tier) {
+        switch (tier) {
+            case ResponseTier.Telemetry:    Interlocked.Increment(ref TotalAlertsTier0Suppressed); break;
+            case ResponseTier.Alert:        Interlocked.Increment(ref TotalAlertsTier1); break;
+            case ResponseTier.Investigate:  Interlocked.Increment(ref TotalAlertsTier2); break;
+            case ResponseTier.Respond:      Interlocked.Increment(ref TotalAlertsTier3); break;
+        }
+    }
+
+    private static ConcurrentDictionary<string, long> _yaraRecentlyRequested =
+        new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    private const long _yaraRecentTtlTicks = 300_000_000L; // 30s in 100ns ticks
+    public static void RequestYaraScan(string path, string context) {
+        RequestYaraScan(path, context, ResponseTier.Investigate);
+    }
+
+    public static void RequestYaraScan(string path, string context, ResponseTier tier) {
+        if (!IsArmed) return;
+        if (tier < ResponseTier.Investigate) return;
+        if (string.IsNullOrEmpty(path)) return;
+        if (_yaraScanQueue.IsAddingCompleted) return;
+        if (IsYaraScanExcluded(path)) return;
+
+        long nowTicks = DateTime.UtcNow.Ticks;
+        long lastTicks;
+        if (_yaraRecentlyRequested.TryGetValue(path, out lastTicks) &&
+            nowTicks - lastTicks < _yaraRecentTtlTicks) {
+            return; // already scanned/queued recently
+        }
+        _yaraRecentlyRequested[path] = nowTicks;
+
+        if (_yaraRecentlyRequested.Count > 1024) {
+            long cutoff = nowTicks - _yaraRecentTtlTicks;
+            foreach (var kvp in _yaraRecentlyRequested) {
+                if (kvp.Value < cutoff) {
+                    long ignore;
+                    _yaraRecentlyRequested.TryRemove(kvp.Key, out ignore);
+                }
+            }
+        }
+
+        if (!_yaraScanQueue.TryAdd(path, 0)) {
+            ThrottleYaraQueueFullLog(path);
+        }
+    }
+
     public static bool IsYaraRuleValid(string filePath) {
         try {
             using (var compiler = new libyaraNET.Compiler()) {
@@ -495,6 +733,11 @@ public class DeepVisibilitySensor {
                 return true;
             }
         } catch { return false; }
+    }
+
+    public static void StartYaraWorkerAsync()
+    {
+        Task.Run(() => InitializeYaraWorker());
     }
 
     public static void InitializeYaraWorker() {
@@ -513,7 +756,42 @@ public class DeepVisibilitySensor {
                             var results = scanner.ScanFile(filePath, vector);
                             if (results != null && results.Count > 0) {
                                 foreach (var match in results) {
-                                    EnqueueAlert("YARA_Match", "StaticDetection", "Unknown", "Unknown", 0, 0, 0, filePath, $"Rule: {match.MatchingRule.Identifier}", "", match.MatchingRule.Identifier);
+                                    string ruleId = match.MatchingRule.Identifier;
+
+                                    int observerPid = 0;
+                                    string observerProc = "Unattributed";
+                                    string parentProc = "Unattributed";
+                                    string fileName = System.IO.Path.GetFileName(filePath);
+                                    if (!string.IsNullOrEmpty(fileName)) {
+                                        foreach (var kvp in ProcessCache) {
+                                            if (string.Equals(kvp.Value, fileName, StringComparison.OrdinalIgnoreCase)) {
+                                                observerPid = kvp.Key;
+                                                observerProc = kvp.Value;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    int score = ScoreAlert("high", observerProc, parentProc, observerPid, true);
+                                    ResponseTier tier = TierFromScore(score);
+
+                                    string artifactPath = "";
+                                    if (IsArmed && tier >= ResponseTier.Respond) {
+                                        try {
+                                            string qDir = @"C:\ProgramData\DeepSensor\Data\Quarantine";
+                                            System.IO.Directory.CreateDirectory(qDir);
+                                            string qPath = $@"{qDir}\YaraHit_{ruleId}_{System.IO.Path.GetFileName(filePath)}_{DateTime.UtcNow:yyyyMMddHHmmss}.bin";
+                                            System.IO.File.Copy(filePath, qPath, true);
+                                            artifactPath = qPath;
+                                        } catch (Exception ex) {
+                                            EnqueueDiag($"[YARA WORKER] Quarantine copy failed: {ex.Message}");
+                                        }
+                                    } else if (IsArmed) {
+                                        EnqueueDiag($"[TIER] YARA_Match for {filePath} stayed at Tier={tier}; quarantine copy not taken.");
+                                    }
+
+                                    EnqueueAlert("YARA_Match", "StaticDetection", observerProc, parentProc, observerPid, 0, 0,
+                                                filePath, $"Rule: {ruleId} | Quarantine: {artifactPath}", "", ruleId);
                                 }
                             }
                         }
@@ -542,7 +820,6 @@ public class DeepVisibilitySensor {
         if (!YaraMatrices.ContainsKey(vector)) return "NoSignatureMatch";
 
         try {
-            // The GC handles the unmanaged teardown natively for the Scanner object in this wrapper.
             var scanner = new libyaraNET.Scanner();
             var results = scanner.ScanMemory(payload, YaraMatrices[vector]);
 
@@ -635,6 +912,12 @@ public class DeepVisibilitySensor {
         string procName = GetProcessName(pid);
         if (CriticalSystemProcesses.Contains(procName)) return false;
 
+        int score = ScoreAlert("critical", procName, "", pid, true);
+        if (TierFromScore(score) < ResponseTier.Respond) {
+            EnqueueDiag($"[TIER] Score={score} below Tier3 ({Tier3Threshold}); SuspendThread suppressed for PID {pid} ({procName}). Quarantine copy still attempted by caller.");
+            return false;
+        }
+
         uint THREAD_SUSPEND_RESUME = 0x0002;
         IntPtr hThread = OpenThread(THREAD_SUSPEND_RESUME, false, (uint)tid);
         if (hThread == IntPtr.Zero) return false;
@@ -649,7 +932,6 @@ public class DeepVisibilitySensor {
         string procName = GetProcessName(pid);
         if (CriticalSystemProcesses.Contains(procName)) return yaraResult;
 
-        // Prevent malware from crashing the EDR via massive RWX heap sprays (Cap at 50MB)
         if (size > 52428800) return "AllocationExceedsScanLimit";
 
         uint PROCESS_VM_READ_OPERATION = 0x0010 | 0x0008;
@@ -661,18 +943,17 @@ public class DeepVisibilitySensor {
             if (ReadProcessMemory(hProcess, (IntPtr)address, buffer, (UIntPtr)size, out UIntPtr bytesRead)) {
                 yaraResult = EvaluatePayloadInMemory(buffer, procName);
 
-                // Only write to disk if it actually matches a YARA rule to save I/O overhead
                 if (yaraResult != "NoSignatureMatch") {
                     string quarantineDir = @"C:\ProgramData\DeepSensor\Data\Quarantine";
                     System.IO.Directory.CreateDirectory(quarantineDir);
                     string dumpPath = $@"{quarantineDir}\Payload_{procName}_{pid}_0x{address:X}.bin";
                     System.IO.File.WriteAllBytes(dumpPath, buffer);
+
+                    uint PAGE_NOACCESS = 0x01;
+                    VirtualProtectEx(hProcess, (IntPtr)address, (UIntPtr)size, PAGE_NOACCESS, out uint oldProtect);
                 }
             }
-
-            uint PAGE_NOACCESS = 0x01;
-            VirtualProtectEx(hProcess, (IntPtr)address, (UIntPtr)size, PAGE_NOACCESS, out uint oldProtect);
-        } catch { return "ForensicError"; } finally { CloseHandle(hProcess); }
+        } catch (Exception ex) { EnqueueDiag($"[ACTIVE DEFENSE ERROR] Memory dump failed: {ex.Message}"); return "ForensicError"; } finally { CloseHandle(hProcess); }
         return yaraResult;
     }
 
@@ -691,7 +972,7 @@ public class DeepVisibilitySensor {
                     return dumpPath;
                 }
             }
-        } catch { } finally { CloseHandle(hProcess); }
+        } catch (Exception ex) { EnqueueDiag($"[ACTIVE DEFENSE ERROR] MiniDumpWriteDump failed: {ex.Message}"); } finally { CloseHandle(hProcess); }
         return "Failed";
     }
 
@@ -899,7 +1180,7 @@ public class DeepVisibilitySensor {
                 ImgRules = imgList.ToArray(),
                 WmiRules = wmiList.ToArray()
             };
-        } catch { /* Fail silently to protect the sensor */ }
+        } catch (Exception ex) { EnqueueDiag($"[TTP COMPILER ERROR] Failed to parse TTP matrix: {ex.Message}"); }
     }
 
     [ThreadStatic]
@@ -992,7 +1273,7 @@ public class DeepVisibilitySensor {
 
         // --- NATIVE RUST ENGINE FFI IMPORT ---
         try {
-            _mlEnginePtr = init_engine();
+            InitializeEngine();
             if (_mlEnginePtr != IntPtr.Zero) {
                 // Success: Engine is mapped and database is ready
                 EnqueueDiag("[ML ENGINE] Native DLL successfully mapped at memory address: 0x" + _mlEnginePtr.ToString("X"));
@@ -1075,6 +1356,12 @@ public class DeepVisibilitySensor {
         _mlConsumerTask = Task.Factory.StartNew(() => {
             try {
                 while (!_mlWorkQueue.IsCompleted) {
+                    if (_mlEnginePtr == IntPtr.Zero) {
+                        try { Task.Delay(50, _mlCancelSource.Token).Wait(_mlCancelSource.Token); }
+                        catch (OperationCanceledException) { break; }
+                        continue;
+                    }
+
                     var batch = new List<string>();
 
                     // Block indefinitely until at least ONE event arrives
@@ -1086,18 +1373,25 @@ public class DeepVisibilitySensor {
                             batch.Add(nextEvent);
                         }
 
-                        if (_mlEnginePtr == IntPtr.Zero) continue;
-
-                        // Wrap the batch in a JSON array format for Rust
                         string jsonArray = "[" + string.Join(",", batch) + "]";
                         Interlocked.Add(ref TotalMlEvals, batch.Count);
 
                         IntPtr resultPtr = evaluate_telemetry(_mlEnginePtr, jsonArray);
+
                         if (resultPtr != IntPtr.Zero) {
-                            string alertJson = Marshal.PtrToStringAnsi(resultPtr);
-                            free_string(resultPtr);
-                            if (!string.IsNullOrEmpty(alertJson)) {
-                                EventQueue.Enqueue($"[ML_ALERTS]{alertJson}");
+                            try {
+                                int len = 0;
+                                while (Marshal.ReadByte(resultPtr, len) != 0) { len++; }
+                                byte[] buffer = new byte[len];
+                                Marshal.Copy(resultPtr, buffer, 0, len);
+
+                                string resultStr = Encoding.UTF8.GetString(buffer);
+                                if (!string.IsNullOrWhiteSpace(resultStr)) {
+                                    _alertOutbox.Enqueue(resultStr);
+                                }
+                            }
+                            finally {
+                                free_string(resultPtr);
                             }
                         }
                     }
@@ -1108,6 +1402,24 @@ public class DeepVisibilitySensor {
                 EnqueueDiag($"[ML CONSUMER FATAL] {ex.Message}");
             }
         }, _mlCancelSource.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        Task.Run(async () => {
+            while (!_mlCancelSource.Token.IsCancellationRequested) {
+                try {
+                    if (_alertOutbox.TryDequeue(out string alertJson)) {
+                        EventQueue.Enqueue($"[ML_ALERTS]{alertJson}");
+                    } else {
+                        await Task.Delay(10, _mlCancelSource.Token);
+                    }
+                }
+                catch (OperationCanceledException) {
+                    break;
+                }
+                catch (Exception ex) {
+                    EnqueueDiag($"[DISPATCHER FATAL ERROR] Failed to route alert: {ex.Message}");
+                }
+            }
+        }, _mlCancelSource.Token);
     }
 
     public static void UpdateThreatIntel(string[] tiDrivers) {
@@ -1273,14 +1585,6 @@ public class DeepVisibilitySensor {
                     return;
                 }
 
-                if (!_yaraScanQueue.IsAddingCompleted && !string.IsNullOrEmpty(path)) {
-                    if (path.IndexOf("C:\\Windows\\System32\\", StringComparison.OrdinalIgnoreCase) < 0 &&
-                        path.IndexOf("C:\\Windows\\SysWOW64\\", StringComparison.OrdinalIgnoreCase) < 0) {
-
-                        _yaraScanQueue.Add(path);
-                    }
-                }
-
                 var matrix = _activeMatrix;
                 bool ttpMatched = false;
                 TtpRuleMatrix ttpMatrix = _ttpMatrix;
@@ -1318,7 +1622,18 @@ public class DeepVisibilitySensor {
                         string alertMessage = $"TTP Match: {matchedTtpRules[0].signature_name}";
                         if (matchedTtpRules.Count > 1) alertMessage = "TTP SIG Parsed From Multiple Rules, Cannot Attribute to Specific Rule - Check Rules";
 
-                        EnqueueTtpAlert("AdvancedDetection", image, "Unknown", data.ProcessID, 0, data.ThreadID, path, alertMessage, matchedTrigger, matchedTtpRules[0]);
+                        string ttpSev = string.IsNullOrEmpty(matchedTtpRules[0].severity) ? "high" : matchedTtpRules[0].severity;
+                        int score = ScoreAlert(ttpSev, image, "Unknown", data.ProcessID, false);
+                        ResponseTier tier = TierFromScore(score);
+                        RecordTier(tier);
+                        EnqueueDiag($"[TIER] Score={score} Tier={tier} Actor={image} Rule={matchedTtpRules[0].signature_name}");
+
+                        if (tier >= ResponseTier.Alert) {
+                            EnqueueTtpAlert("AdvancedDetection", image, "Unknown", data.ProcessID, 0, data.ThreadID, path, alertMessage, matchedTrigger, matchedTtpRules[0]);
+                        }
+                        if (tier >= ResponseTier.Investigate) {
+                            RequestYaraScan(path, "ImageLoad_TTP", tier);
+                        }
                         ttpMatched = true;
                     }
                 }
@@ -1342,7 +1657,17 @@ public class DeepVisibilitySensor {
                         string cacheKey = $"{image}|{cacheRuleName}";
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "Image_Load", image, "", data.ProcessID, 0, data.ThreadID, path, "", "Suspicious Module Load", mRule.title, mRule.severity, mRule.tags);
+                            int score = ScoreAlert(mRule.severity, image, "", data.ProcessID, false);
+                            ResponseTier tier = TierFromScore(score);
+                            RecordTier(tier);
+                            EnqueueDiag($"[TIER] Score={score} Tier={tier} Actor={image} Rule={cacheRuleName}");
+
+                            if (tier >= ResponseTier.Alert) {
+                                EnqueueAlert("Sigma_Match", "Image_Load", image, "", data.ProcessID, 0, data.ThreadID, path, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
+                            }
+                            if (tier >= ResponseTier.Investigate) {
+                                RequestYaraScan(path, "ImageLoad_Sigma", tier);
+                            }
                             SuppressProcessRule(image, cacheRuleName);
                         } else {
                             string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, path, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
@@ -1354,7 +1679,7 @@ public class DeepVisibilitySensor {
                     }
                 }
                 EnqueueRaw("ImageLoad", image, "Unknown", path, "", data.ProcessID, data.ThreadID);
-            } catch { }
+            } catch (Exception ex) { EnqueueDiag($"[ETW ERROR] ImageLoad parsing failed: {ex.Message}"); }
         };
 
         _session.Source.Kernel.TcpIpConnect += delegate (TcpIpConnectTraceData data) {
@@ -1427,8 +1752,7 @@ public class DeepVisibilitySensor {
                 if (rawJson != null && _aggregator != null) {
                     _aggregator.AddEvent(rawJson, "", image, "NetworkConnect", "", destIp, destPort.ToString(), data.ThreadID, GetEventUser(data.ProcessID));
                 }
-
-            } catch { }
+            } catch (Exception ex) { EnqueueDiag($"[ETW ERROR] TcpIpConnect parsing failed: {ex.Message}"); }
         };
 
         _session.Source.Kernel.StackWalkStack += delegate (StackWalkStackTraceData data) {
@@ -1549,7 +1873,7 @@ public class DeepVisibilitySensor {
                         string cacheKey = $"{image}|{cacheRuleName}";
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "Process_Creation", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", "Suspicious Process", mRule.title, mRule.severity, mRule.tags);
+                            EnqueueAlert("Sigma_Match", "Process_Creation", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
                             SuppressProcessRule(image, cacheRuleName);
                         } else {
                             string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, parentName, data.ProcessID, data.ParentID, data.ThreadID, cmd, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
@@ -1649,7 +1973,7 @@ public class DeepVisibilitySensor {
                         string cacheKey = $"{image}|{cacheRuleName}";
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "Registry_Event", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", "Suspicious Registry Modification", mRule.title, mRule.severity, mRule.tags);
+                            EnqueueAlert("Sigma_Match", "Registry_Event", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
                             SuppressProcessRule(image, cacheRuleName);
                         } else {
                             string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, fullReg, "", fullReg, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
@@ -1661,7 +1985,7 @@ public class DeepVisibilitySensor {
                     }
                 }
                 EnqueueRaw("RegistryWrite", image, "Unknown", fullReg, "", data.ProcessID, data.ThreadID);
-            } catch { }
+            } catch (Exception ex) { EnqueueDiag($"[ETW ERROR] RegistrySetValue parsing failed: {ex.Message}"); }
         };
 
         _session.Source.Kernel.FileIOCreate += delegate (FileIOCreateTraceData data) {
@@ -1673,17 +1997,6 @@ public class DeepVisibilitySensor {
                 if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
                         return;
                     }
-
-                if (!_yaraScanQueue.IsAddingCompleted && !string.IsNullOrEmpty(path)) {
-                    if (path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
-                        path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
-                        path.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ||
-                        path.EndsWith(".vbs", StringComparison.OrdinalIgnoreCase) ||
-                        path.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)) {
-
-                        _yaraScanQueue.Add(path);
-                    }
-                }
 
                 var matrix = _activeMatrix;
                 bool ttpMatched = false;
@@ -1721,7 +2034,18 @@ public class DeepVisibilitySensor {
                         string alertMessage = $"TTP Match: {matchedTtpRules[0].signature_name}";
                         if (matchedTtpRules.Count > 1) alertMessage = "TTP SIG Parsed From Multiple Rules, Cannot Attribute to Specific Rule - Check Rules";
 
-                        EnqueueTtpAlert("AdvancedDetection", image, "Unknown", data.ProcessID, 0, data.ThreadID, path, alertMessage, matchedTrigger, matchedTtpRules[0]);
+                        string ttpSev = string.IsNullOrEmpty(matchedTtpRules[0].severity) ? "high" : matchedTtpRules[0].severity;
+                        int score = ScoreAlert(ttpSev, image, "Unknown", data.ProcessID, false);
+                        ResponseTier tier = TierFromScore(score);
+                        RecordTier(tier);
+                        EnqueueDiag($"[TIER] Score={score} Tier={tier} Actor={image} Rule={matchedTtpRules[0].signature_name}");
+
+                        if (tier >= ResponseTier.Alert) {
+                            EnqueueTtpAlert("AdvancedDetection", image, "Unknown", data.ProcessID, 0, data.ThreadID, path, alertMessage, matchedTrigger, matchedTtpRules[0]);
+                        }
+                        if (tier >= ResponseTier.Investigate) {
+                            RequestYaraScan(path, "FileIOCreate_TTP", tier);
+                        }
                         ttpMatched = true;
                     }
                 }
@@ -1744,7 +2068,17 @@ public class DeepVisibilitySensor {
                         string cacheKey = $"{image}|{cacheRuleName}";
 
                         if (!SuppressedSigmaRules.ContainsKey(cacheRuleName) && !SuppressedProcessRules.ContainsKey(cacheKey)) {
-                            EnqueueAlert("Sigma_Match", "File_Event", image, "", data.ProcessID, 0, data.ThreadID, path, "", "Suspicious File IO", mRule.title, mRule.severity, mRule.tags);
+                            int score = ScoreAlert(mRule.severity, image, "", data.ProcessID, false);
+                            ResponseTier tier = TierFromScore(score);
+                            RecordTier(tier);
+                            EnqueueDiag($"[TIER] Score={score} Tier={tier} Actor={image} Rule={cacheRuleName}");
+
+                            if (tier >= ResponseTier.Alert) {
+                                EnqueueAlert("Sigma_Match", "File_Event", image, "", data.ProcessID, 0, data.ThreadID, path, "", mRule.title, mRule.title, mRule.severity, mRule.tags);
+                            }
+                            if (tier >= ResponseTier.Investigate) {
+                                RequestYaraScan(path, "FileIOCreate_Sigma", tier);
+                            }
                             SuppressProcessRule(image, cacheRuleName);
                         } else {
                             string jsonEvent = BuildEnrichedJson("UEBA_Audit", "Suppressed_Rule_Hit", image, "", data.ProcessID, 0, data.ThreadID, path, "", path, mRule.id, "", mRule.title, mRule.severity, mRule.tags);
@@ -1756,7 +2090,7 @@ public class DeepVisibilitySensor {
                     }
                 }
                 EnqueueRaw("FileIOCreate", image, "Unknown", path, "", data.ProcessID, data.ThreadID);
-            } catch { }
+            } catch (Exception ex) { EnqueueDiag($"[ETW ERROR] FileIOCreate parsing failed: {ex.Message}"); }
         };
 
         _session.Source.Kernel.FileIOWrite += delegate (FileIOReadWriteTraceData data) {
@@ -1772,24 +2106,25 @@ public class DeepVisibilitySensor {
 
         _session.Source.Kernel.VirtualMemAlloc += delegate (VirtualAllocTraceData data) {
             int flags = (int)data.Flags;
-            // Catch BOTH 0x40 (PAGE_EXECUTE_READWRITE) and 0x20 (PAGE_EXECUTE_READ)
-            // This captures the exact moment RW memory is transitioned to RX for execution
-            if (flags == 0x40 || flags == 0x20) {
 
-                // Do not scan our own memory allocations
+            if (flags == 0x40 || flags == 0x20) {
                 if (data.ProcessID != SensorPid && data.ProcessID != 0) {
                     ulong baseAddr = Convert.ToUInt64(data.PayloadByName("BaseAddress"));
                     ulong regSize  = Convert.ToUInt64(data.PayloadByName("RegionSize"));
+                    int pid = data.ProcessID;
+                    int tid = data.ThreadID;
 
-                    // 1. Dump the specific RWX shellcode to disk
-                    // 2. Scan it with the Context-Aware YARA matrices
-                    // 3. Strip the memory of executable permissions (PAGE_NOACCESS)
-                    string yaraResult = NeuterAndDumpPayload(data.ProcessID, baseAddr, regSize);
+                    try {
+                        Task.Run(() => {
+                            string yaraResult = NeuterAndDumpPayload(pid, baseAddr, regSize);
 
-                    if (yaraResult != "NoSignatureMatch" && yaraResult != "HandleAccessDenied") {
-                        // We got a YARA hit! Quarantine the thread that injected it.
-                        bool neutralized = QuarantineNativeThread(data.ThreadID, data.ProcessID);
-                        EnqueueAlert("T1055", "YaraPayloadAttribution", GetProcessName(data.ProcessID), "Unknown", data.ProcessID, 0, data.ThreadID, "", $"YARA Hit: {yaraResult} | Thread Frozen: {neutralized}");
+                            if (yaraResult != "NoSignatureMatch" && yaraResult != "HandleAccessDenied" && yaraResult != "AllocationExceedsScanLimit") {
+                                bool neutralized = QuarantineNativeThread(tid, pid);
+                                EnqueueAlert("T1055", "YaraPayloadAttribution", GetProcessName(pid), "Unknown", pid, 0, tid, "", $"YARA Hit: {yaraResult} | Thread Frozen: {neutralized}");
+                            }
+                        });
+                    } catch (Exception ex) {
+                        EnqueueDiag($"[ETW WARNING] ThreadPool exhausted. Skipped VirtualMemAlloc scan for PID {pid}: {ex.Message}");
                     }
                 }
             }
@@ -1878,6 +2213,8 @@ public class DeepVisibilitySensor {
 
     public static void TeardownEngine() {
         _mlWorkQueue.CompleteAdding();
+        try { _yaraScanQueue.CompleteAdding(); } catch {}
+        try { _yaraCts.Cancel(); } catch {}
         _mlCancelSource.Cancel();
 
         if (_mlConsumerTask != null) { _mlConsumerTask.Wait(2000); }
@@ -1902,22 +2239,47 @@ public class DeepVisibilitySensor {
     private static string GetEventUser(int pid) {
         if (ProcessUserCache.TryGetValue(pid, out string user)) return user;
 
-        user = "UNKNOWN";
-        try {
-            using (var searcher = new System.Management.ManagementObjectSearcher($"Select * From Win32_Process Where ProcessID = {pid}")) {
-                foreach (System.Management.ManagementObject mo in searcher.Get()) {
-                    string[] ownerInfo = new string[2];
-                    mo.InvokeMethod("GetOwner", (object[])ownerInfo);
-                    if (ownerInfo[0] != null) {
-                        user = string.IsNullOrWhiteSpace(ownerInfo[1]) ? ownerInfo[0] : $"{ownerInfo[1]}\\{ownerInfo[0]}";
+        if (!_userResolveQueue.IsAddingCompleted) {
+            _userResolveQueue.TryAdd(pid, 0);
+        }
+        return "PENDING";
+    }
+
+    public static void StartUserResolverWorker() {
+        if (Interlocked.Exchange(ref _userResolverStarted, 1) == 1) return;
+
+        Task.Run(() => {
+            try {
+                foreach (int pid in _userResolveQueue.GetConsumingEnumerable(_mlCancelSource.Token)) {
+                    if (ProcessUserCache.ContainsKey(pid)) continue; // already resolved by an earlier dequeue
+
+                    string user = "UNKNOWN";
+                    try {
+                        using (var searcher = new System.Management.ManagementObjectSearcher(
+                            $"Select * From Win32_Process Where ProcessID = {pid}")) {
+                            foreach (System.Management.ManagementObject mo in searcher.Get()) {
+                                string[] ownerInfo = new string[2];
+                                mo.InvokeMethod("GetOwner", (object[])ownerInfo);
+                                if (ownerInfo[0] != null) {
+                                    user = string.IsNullOrWhiteSpace(ownerInfo[1])
+                                        ? ownerInfo[0]
+                                        : $"{ownerInfo[1]}\\{ownerInfo[0]}";
+                                }
+                                break;
+                            }
+                        }
                     }
-                    break;
+                    catch (Exception ex) {
+                        user = "NT AUTHORITY\\SYSTEM";
+                        EnqueueDiag($"[USER RESOLVER] WMI lookup failed for PID {pid}: {ex.Message}");
+                    }
+
+                    ProcessUserCache.TryAdd(pid, user);
                 }
             }
-        } catch { user = "NT AUTHORITY\\SYSTEM"; }
-
-        ProcessUserCache.TryAdd(pid, user);
-        return user;
+            catch (OperationCanceledException) { /* normal shutdown via _mlCancelSource */ }
+            catch (Exception ex) { EnqueueDiag($"[USER RESOLVER FATAL] worker exited: {ex.Message}"); }
+        }, _mlCancelSource.Token);
     }
 
     // EnqueueAlert with Fingerprinting + Full Config Exclusions
@@ -1931,7 +2293,7 @@ public class DeepVisibilitySensor {
         try {
             if (_mlEnginePtr != IntPtr.Zero) {
                 if (!_mlWorkQueue.IsAddingCompleted)
-                    _mlWorkQueue.Add(jsonEvent);
+                    _mlWorkQueue.TryAdd(jsonEvent, 10);
             } else {
                 EventQueue.Enqueue(jsonEvent);
             }
@@ -1969,14 +2331,11 @@ public class DeepVisibilitySensor {
 
         Interlocked.Increment(ref TotalAlertsGenerated);
 
-        try
-        {
-            if (!_mlWorkQueue.IsAddingCompleted)
-            {
-                _mlWorkQueue.Add(json);
+        try {
+            if (!_mlWorkQueue.IsAddingCompleted) {
+                _mlWorkQueue.TryAdd(json, 10);
             }
-        }
-        catch (InvalidOperationException) { }
+        } catch (InvalidOperationException) { }
     }
 
     private static void EnqueueRaw(string type, string process, string parent, string path, string cmd, int pid, int tid) {
@@ -1992,7 +2351,7 @@ public class DeepVisibilitySensor {
                 if (_aggregator != null)
                     _aggregator.AddEvent(jsonEvent, parent, process, type, "", cmd, path, tid, eventUser);
                 else
-                    _mlWorkQueue.Add(jsonEvent);
+                    _mlWorkQueue.TryAdd(jsonEvent, 10);
             }
         } catch (InvalidOperationException) { }
     }

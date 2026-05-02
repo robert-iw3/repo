@@ -1390,7 +1390,14 @@ try {
     } catch {}
 
     Write-Host "    [4/5] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
-    try { [RealTimeDataSensor]::StopSession() } catch {
+    try {
+        if ($global:dataBatch -and $global:dataBatch.Count -gt 0 -and $null -ne $global:LogFile) {
+            $batchOutput = ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
+            try { [System.IO.File]::AppendAllText($global:LogFile, $batchOutput + "`r`n") } catch { }
+        }
+
+        [RealTimeDataSensor]::StopSession()
+    } catch {
         Write-Diag "StopSession error (non-fatal): $_" "WARN"
     }
     Write-Diag "C# TraceEvent Session halted and Rust FFI pointer freed." "INFO"

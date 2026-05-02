@@ -16,6 +16,8 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 pub struct TransmissionConfig {
     pub enable_sync: bool,
@@ -73,6 +75,24 @@ impl TransmissionConfig {
                 .eq_ignore_ascii_case("true"),
         }
     }
+
+    /// Derive the DLQ spool file path from the sensor type.
+    ///
+    /// Maps sensor_type to its ProgramData directory:
+    ///   "deepsensor"    -> C:\ProgramData\DeepSensor\Logs\Transmission_DLQ.jsonl
+    ///   "datasensor"    -> C:\ProgramData\DataSensor\Logs\Transmission_DLQ.jsonl
+    ///   "c2sensor"      -> C:\ProgramData\C2Sensor\Logs\Transmission_DLQ.jsonl
+    ///   "idpssensor"    -> C:\ProgramData\IDPSSensor\Logs\Transmission_DLQ.jsonl
+    pub fn dlq_path(&self) -> String {
+        let folder_name = match self.sensor_type.as_str() {
+            "deepsensor" => "DeepSensor",
+            "datasensor" => "DataSensor",
+            "c2sensor"   => "C2Sensor",
+            "idpssensor" => "IDPSSensor",
+            _ => &self.sensor_type,
+        };
+        format!(r"C:\ProgramData\{}\Logs\Transmission_DLQ.jsonl", folder_name)
+    }
 }
 
 fn generate_transmission_key(val: &Value) -> String {
@@ -87,7 +107,9 @@ fn generate_transmission_key(val: &Value) -> String {
         .get("SignatureName")
         .or_else(|| val.get("reason"))
         .or_else(|| val.get("MatchedIndicator"))
+        .or_else(|| val.get("alert_reason"))
         .or_else(|| val.get("action"))
+        .or_else(|| val.get("flow_key"))
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown");
 
@@ -106,6 +128,39 @@ fn generate_transmission_key(val: &Value) -> String {
     }
 }
 
+// THE DLQ MEMORY GUARD
+struct DlqBatchGuard {
+    pub batch: Vec<Value>,
+    pub dlq_path: String,
+    pub is_success: bool,
+}
+
+impl DlqBatchGuard {
+    pub fn flush_to_disk(&mut self) {
+        if !self.batch.is_empty() {
+            if let Some(parent) = std::path::Path::new(&self.dlq_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&self.dlq_path) {
+                for event in &self.batch {
+                    let _ = writeln!(file, "{}", serde_json::to_string(event).unwrap_or_default());
+                }
+            }
+            self.batch.clear(); // Clear to prevent the Drop trait from double-writing
+        }
+    }
+}
+
+impl Drop for DlqBatchGuard {
+    fn drop(&mut self) {
+        if !self.is_success {
+            self.flush_to_disk();
+        }
+    }
+}
+
+// ============================================================================
+
 pub async fn start_transmission_worker(
     config_path: String,
     mut rx: Receiver<Value>,
@@ -119,7 +174,7 @@ pub async fn start_transmission_worker(
         return;
     }
 
-    let mut dedup_matrix = LruCache::new(NonZeroUsize::new(50_000).unwrap());
+    let dlq_path = config.dlq_path();
 
     let mut headers = header::HeaderMap::new();
     headers.insert(
@@ -131,16 +186,13 @@ pub async fn start_transmission_worker(
         header::HeaderValue::from_str(&config.sensor_type).unwrap(),
     );
 
-    // ── Build the HTTP client ────────────────────────────────────────────────
-    // In production with a CA-signed cert, `TrustSelfSignedCert` should be
-    // False (or omitted) so the full certificate chain is validated.
     let mut builder = Client::builder()
         .use_rustls_tls()
         .default_headers(headers)
         .timeout(Duration::from_secs(15));
 
     if config.trust_self_signed {
-        log_diag("[Transmission] WARNING: TrustSelfSignedCert=True — certificate validation DISABLED.");
+        log_diag("[Transmission] WARNING: TrustSelfSignedCert=True -- certificate validation DISABLED.");
         builder = builder.danger_accept_invalid_certs(true);
     }
 
@@ -153,122 +205,130 @@ pub async fn start_transmission_worker(
         if config.trust_self_signed { " (self-signed OK)" } else { "" }
     ));
 
-    loop {
-        let mut batch: Vec<Value> = Vec::with_capacity(config.max_batch_size);
+    let mut dedup_matrix = LruCache::new(NonZeroUsize::new(10_000).unwrap());
 
-        // Idle at 0% CPU until at least ONE event arrives
+    loop {
+        let mut guard = DlqBatchGuard {
+            batch: Vec::with_capacity(config.max_batch_size),
+            dlq_path: dlq_path.clone(),
+            is_success: false,
+        };
+
         if let Some(first) = rx.recv().await {
-            let key = generate_transmission_key(&first);
-            if !dedup_matrix.contains(&key) {
-                dedup_matrix.put(key, ());
-                batch.push(first);
+            let mut hasher = DefaultHasher::new();
+            generate_transmission_key(&first).hash(&mut hasher);
+            let first_key_hash = hasher.finish();
+
+            if !dedup_matrix.contains(&first_key_hash) {
+                dedup_matrix.put(first_key_hash, ());
+                guard.batch.push(first);
             }
 
-            // Collect more events within the batch interval window
             let timeout = sleep(Duration::from_millis(config.batch_interval_ms));
             tokio::pin!(timeout);
 
+            // --- BATCH COLLECTION LOOP ---
             loop {
-                if batch.len() >= config.max_batch_size {
-                    break;
-                }
+                if guard.batch.len() >= config.max_batch_size { break; }
 
                 tokio::select! {
-                    _ = &mut timeout => {
-                        break; // Window expired, flush
-                    }
+                    _ = &mut timeout => { break; }
                     msg_opt = rx.recv() => {
                         match msg_opt {
                             Some(next) => {
-                                let key = generate_transmission_key(&next);
-                                if !dedup_matrix.contains(&key) {
-                                    dedup_matrix.put(key, ());
-                                    batch.push(next);
+                                let mut hasher = DefaultHasher::new();
+                                generate_transmission_key(&next).hash(&mut hasher);
+                                let key_hash = hasher.finish();
+
+                                if !dedup_matrix.contains(&key_hash) {
+                                    dedup_matrix.put(key_hash, ());
+                                    guard.batch.push(next);
                                 }
                             }
-                            None => return, // Channel closed
+                            None => {
+                                log_diag(&format!("[Transmission] Teardown trapped during collection! Synchronously spooling {} events to DLQ...", guard.batch.len()));
+                                guard.flush_to_disk();
+                                return;
+                            }
                         }
                     }
                 }
             }
 
-            if batch.is_empty() {
-                continue;
-            }
+            if guard.batch.is_empty() { continue; }
 
-            // ── Auto-Recovery (Exponential Backoff) ──────────────────────────
             let mut retry_count = 0;
             let mut base_delay_ms = config.base_retry_delay_ms;
             let mut transmission_success = false;
 
-            while retry_count <= config.max_retries {
-                match client.post(&config.endpoint).json(&batch).send().await {
+            // --- NETWORK RETRY LOOP ---
+            while retry_count < config.max_retries {
+                match client.post(&config.endpoint).json(&guard.batch).send().await {
                     Ok(resp) => {
                         let status = resp.status();
                         if status.is_success() {
                             transmission_success = true;
+                            guard.is_success = true;
                             break;
-                        } else if status == StatusCode::TOO_MANY_REQUESTS
-                            || status.is_server_error()
-                        {
-                            log_diag(&format!(
-                                "[Transmission] Middleware backoff (HTTP {}). Retry {}/{}...",
-                                status,
-                                retry_count + 1,
-                                config.max_retries
-                            ));
+                        } else if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                            log_diag(&format!("[Transmission] Middleware backoff (HTTP {}). Retry {}/{}...", status, retry_count + 1, config.max_retries));
                         } else {
-                            // 4xx (auth, bad request) — retrying won't help
-                            log_diag(&format!(
-                                "[Transmission] Fatal rejection (HTTP {}). Dropping batch.",
-                                status
-                            ));
+                            log_diag(&format!("[Transmission] Fatal rejection (HTTP {}). Dropping batch.", status));
+                            guard.is_success = true;
                             break;
                         }
                     }
                     Err(e) => {
-                        log_diag(&format!(
-                            "[Transmission] Network fault: {}. Retry {}/{}...",
-                            e,
-                            retry_count + 1,
-                            config.max_retries
-                        ));
+                        log_diag(&format!("[Transmission] Network fault: {}. Retry {}/{}...", e, retry_count + 1, config.max_retries));
                     }
                 }
 
                 retry_count += 1;
-                if retry_count <= config.max_retries {
-                    sleep(Duration::from_millis(base_delay_ms)).await;
+                if retry_count < config.max_retries {
+                    let backoff_sleep = sleep(Duration::from_millis(base_delay_ms));
+                    tokio::pin!(backoff_sleep);
+
+                    loop {
+                        tokio::select! {
+                            _ = &mut backoff_sleep => {
+                                break;
+                            }
+                            msg_opt = rx.recv() => {
+                                match msg_opt {
+                                    Some(next) => {
+                                        let mut hasher = DefaultHasher::new();
+                                        generate_transmission_key(&next).hash(&mut hasher);
+                                        let key_hash = hasher.finish();
+
+                                        if !dedup_matrix.contains(&key_hash) {
+                                            dedup_matrix.put(key_hash, ());
+
+                                            if guard.batch.len() < config.max_batch_size {
+                                                guard.batch.push(next);
+                                            } else {
+                                                let _ = OpenOptions::new().create(true).append(true).open(&dlq_path)
+                                                    .and_then(|mut f| writeln!(f, "{}", serde_json::to_string(&next).unwrap_or_default()));
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        log_diag(&format!("[Transmission] Teardown trapped during backoff sleep! Synchronously spooling {} events to DLQ...", guard.batch.len()));
+                                        guard.flush_to_disk();
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     base_delay_ms *= 2;
                 }
             }
 
             if !transmission_success {
-                log_diag(&format!(
-                    "[Transmission] CRITICAL: Exhausted retries. Spooling {} events to DLQ.",
-                    batch.len()
-                ));
-
-                let dlq_path = if config.sensor_type == "deepsensor" {
-                    r"C:\ProgramData\DeepSensor\Logs\Transmission_DLQ.jsonl"
-                } else {
-                    r"C:\ProgramData\DataSensor\Logs\Transmission_DLQ.jsonl"
-                };
-
-                if let Ok(mut file) =
-                    OpenOptions::new().create(true).append(true).open(dlq_path)
-                {
-                    for event in &batch {
-                        let _ = writeln!(
-                            file,
-                            "{}",
-                            serde_json::to_string(event).unwrap_or_default()
-                        );
-                    }
-                }
+                log_diag(&format!("[Transmission] CRITICAL: Exhausted retries. Spooling {} events to {}", guard.batch.len(), dlq_path));
             }
         } else {
-            break; // Engine shutting down
+            break;
         }
     }
 }

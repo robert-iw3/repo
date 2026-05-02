@@ -33,12 +33,11 @@ macro_rules! log_diag {
         let msg = format!($($arg)*);
         let ptr = LOG_CALLBACK.load(Ordering::Relaxed);
         if !ptr.is_null() {
+            #[allow(unused_unsafe)]
             let cb: NativeLogCallback = unsafe { std::mem::transmute(ptr) };
-            if let Ok(c_str) = CString::new(msg.clone()) {
+            if let Ok(c_str) = std::ffi::CString::new(msg) {
                 cb(c_str.as_ptr());
             }
-        } else {
-            eprintln!("{}", msg);
         }
     }};
 }
@@ -502,7 +501,7 @@ pub extern "C" fn scan_text_payload(
             if let Some(obj) = json_val.as_object_mut() {
                 obj.entry("timestamp").or_insert_with(|| serde_json::json!(chrono::Utc::now().to_rfc3339()));
                 obj.entry("event_type").or_insert_with(|| serde_json::json!(&alert.alert_type));
-                obj.entry("bytes").or_insert(serde_json::json!(text.len() as i64)); 
+                obj.entry("bytes").or_insert(serde_json::json!(text.len() as i64));
                 obj.entry("is_dlp_hit").or_insert(serde_json::json!(true));
             }
             let _ = engine.tx.try_send(json_val);
@@ -543,53 +542,30 @@ pub extern "C" fn free_string(s: *mut c_char) {
 }
 
 #[no_mangle]
-pub extern "C" fn teardown_engine(engine_ptr: *mut std::sync::Mutex<DlpEngine>) {
-    if engine_ptr.is_null() {
-        return;
-    }
+pub extern "C" fn teardown_engine(engine_ptr: *mut Mutex<DlpEngine>) {
+    if !engine_ptr.is_null() {
+        unsafe {
+            let engine_box = Box::from_raw(engine_ptr);
+            let mut engine = match engine_box.lock() { Ok(g) => g, Err(p) => p.into_inner() };
 
-    let engine_box = unsafe { Box::from_raw(engine_ptr) };
-    let mut engine = match engine_box.into_inner() {
-        Ok(e) => e,
-        Err(p) => p.into_inner(),
-    };
+            let (dummy_tx, _) = mpsc::channel(1);
+            let real_tx = std::mem::replace(&mut engine.tx, dummy_tx);
+            drop(real_tx);
 
-    engine.db_conn.set_prepared_statement_cache_capacity(0);
+            std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let flushed = (|| -> bool {
-        for mode in &["FULL", "RESTART", "TRUNCATE"] {
-            for attempt in 0..5u32 {
-                let pragma = format!("PRAGMA wal_checkpoint({});", mode);
-                if let Ok(mut stmt) = engine.db_conn.prepare(&pragma) {
-                    if let Ok(mut rows) = stmt.query([]) {
-                        if let Ok(Some(row)) = rows.next() {
-                            let busy: i64 = row.get(0).unwrap_or(1);
-                            let log_frames: i64 = row.get(1).unwrap_or(-1);
-                            let ckpt_frames: i64 = row.get(2).unwrap_or(-1);
-                            if busy == 0 && log_frames == ckpt_frames {
-                                return true; // clean flush confirmed
-                            }
-                        }
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt as u64 + 1)));
+            let _ = engine.db_conn.execute_batch("PRAGMA optimize;");
+            let _ = engine.db_conn.execute_batch("PRAGMA journal_mode=DELETE;");
+
+            let db_conn = std::mem::replace(
+                &mut engine.db_conn,
+                Connection::open_in_memory().expect("in-memory fallback"),
+            );
+
+            if let Err(e) = db_conn.close() {
+                log_diag!("[DataSensor ML] WARNING: DB close returned error: {:?}", e);
             }
         }
-        false
-    })();
-
-    if !flushed {
-        log_diag!("[DataSensor ML] WARNING: WAL checkpoint incomplete — forcing journal_mode=DELETE before close.");
-        let _ = engine.db_conn.execute_batch("PRAGMA journal_mode=DELETE;");
-    }
-
-    let db_conn = std::mem::replace(
-        &mut engine.db_conn,
-        Connection::open_in_memory().expect("in-memory fallback"),
-    );
-
-    if let Err(e) = db_conn.close() {
-        log_diag!("[DataSensor ML] WARNING: DB close returned error: {:?}", e);
     }
 }
 

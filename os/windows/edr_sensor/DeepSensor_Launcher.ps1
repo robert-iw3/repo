@@ -77,7 +77,6 @@ param (
 logman stop "NT Kernel Logger" -ets >$null 2>&1
 
 # --- Global Failsafe ---
-# Catch standard PowerShell exits and OS Shutdowns
 Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action {
     try {
         if ([DeepVisibilitySensor]::IsSessionHealthy()) {
@@ -101,7 +100,6 @@ if ($Background) {
     using System;
     using System.Runtime.InteropServices;
     public class ConsoleInterop {
-        // FIX: GetConsoleWindow lives in kernel32.dll
         [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     }
@@ -138,6 +136,9 @@ $script:logBatch = [System.Collections.Generic.List[string]]::new()
 # Dedicated UEBA JSONL pipeline
 $script:uebaBatch = [System.Collections.Generic.List[string]]::new()
 $UebaLogPath = $LogPath -replace "DeepSensor_Events.jsonl", "DeepSensor_UEBA_Events.jsonl"
+
+$global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$global:HistoricalSuppressions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 $ScriptDir = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($ScriptDir)) {
@@ -1071,6 +1072,39 @@ function Invoke-HostIsolation {
     }
 }
 
+function Write-RotatedJsonl {
+    param (
+        [string]$FilePath,
+        [string]$JsonPayload
+    )
+    try {
+        [System.IO.File]::AppendAllText($FilePath, $JsonPayload + "`r`n")
+
+        # 2. Ephemeral HUD Check (Hard Cap at 10MB to prevent I/O burn)
+        $fileInfo = New-Object System.IO.FileInfo($FilePath)
+        if ($fileInfo.Length -gt 10485760) {
+            # Keep only the last 2000 lines for the Web UI, truncate the rest.
+            # History is perfectly safe in the Rust SQLite Ledger.
+            $tail = Get-Content $FilePath -Tail 2000
+            [System.IO.File]::WriteAllLines($FilePath, $tail)
+            Write-Diag "Rotated ephemeral HUD log: $FilePath (Exceeded 10MB threshold)" "INFO"
+        }
+    } catch { }
+}
+
+function Submit-UebaAudit {
+    param([PSCustomObject]$AuditObj)
+
+    $payload = $AuditObj | ConvertTo-Json -Compress
+
+    # PERMANENT STORAGE: Push to the ultra-compressed Rust SQLite WAL Database
+    try { [DeepVisibilitySensor]::RouteUebaToSqlite($payload) } catch {}
+
+    # EPHEMERAL HUD: Write to JSONL with strict 10MB rotation
+    $UebaLogPath = Join-Path "C:\ProgramData\DeepSensor\Logs" "DeepSensor_UEBA.jsonl"
+    Write-RotatedJsonl -FilePath $UebaLogPath -JsonPayload $payload
+}
+
 function Submit-SensorAlert {
     param(
         [string]$Type, [string]$TargetObject, [string]$Image, [string]$Flags,
@@ -1087,7 +1121,11 @@ function Submit-SensorAlert {
         $global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     }
 
-    if ($Type -ne "TTP_Match" -and -not $global:HistoricalAlerts.Add($dedupKey)) {
+    # TTP_Match always re-fires. Sigma re-fires only when regression mode is active.
+    $bypassDedup = ($Type -eq "TTP_Match") -or
+                ($global:RegressionTestMode -eq $true -and $Type -eq "Sigma_Match")
+
+    if (-not $bypassDedup -and -not $global:HistoricalAlerts.Add($dedupKey)) {
         return
     }
 
@@ -1118,6 +1156,15 @@ function Submit-SensorAlert {
     }
 
     $global:cycleAlerts[$dedupKey] = $alertObj
+
+    if (-not $IsSuppressed) {
+        try {
+            $GatewayPayload = $alertObj | ConvertTo-Json -Compress
+            [DeepVisibilitySensor]::TransmitAlertToGateway($GatewayPayload)
+        } catch {
+            Write-Diag "Failed to bridge orchestrator alert to FFI transmission gateway: $($_.Exception.Message)" "WARN"
+        }
+    }
 
     # 3. Instant HUD Rendering & Defense Routing
     if ($IsSuppressed) { return }
@@ -1348,7 +1395,7 @@ function Initialize-TraceEventDependency {
         if ($OfflineRepoPath) {
             Copy-Item (Join-Path $OfflineRepoPath "libyaranet.nupkg") -Destination $YARA_Zip -Force
         } else {
-            Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/libyara.NET/3.5.2" -OutFile $YARA_Zip -UseBasicParsing
+            Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.O365.Security.Native.libyara.NET/4.5.5" -OutFile $YARA_Zip -UseBasicParsing
         }
         Expand-Archive -Path $YARA_Zip -DestinationPath "$ExtractBase\YARA" -Force
         Remove-Item $YARA_Zip -Force -ErrorAction SilentlyContinue
@@ -1376,9 +1423,27 @@ function Initialize-TraceEventDependency {
                 }
             }
 
-            $ManagedYara = Get-ChildItem -Path "$ExtractBase\YARA" -Filter "libyara.NET.dll" -Recurse | Select-Object -First 1
-            $UnmanagedYara = Get-ChildItem -Path "$ExtractBase\YARA" -Filter "yara.dll" -Recurse | Where-Object { $_.FullName -match "win-x64" } | Select-Object -First 1
+            $ProcArch = if ([Environment]::Is64BitProcess) {
+                if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
+            } else { 'x86' }
 
+            $ManagedYara = Get-ChildItem -Path "$ExtractBase\YARA" -Filter "libyara.NET.dll" -Recurse |
+                           Where-Object { $_.FullName -match "[\\/]$ProcArch[\\/]" } |
+                           Select-Object -First 1
+            if (-not $ManagedYara) {
+                $ManagedYara = Get-ChildItem -Path "$ExtractBase\YARA" -Filter "libyara.NET.dll" -Recurse |
+                               Where-Object { $_.FullName -notmatch "[\\/](x86|x64|arm64)[\\/]" } |
+                               Select-Object -First 1
+            }
+            if (-not $ManagedYara) {
+                throw "libyara.NET.dll not found for architecture '$ProcArch' under $ExtractBase\YARA"
+            }
+
+            $UnmanagedYara = Get-ChildItem -Path "$ExtractBase\YARA" -Filter "yara.dll" -Recurse |
+                             Where-Object { $_.FullName -match "win-$ProcArch" } |
+                             Select-Object -First 1
+
+            Write-Diag "    [+] Selected libyara.NET.dll ($ProcArch): $($ManagedYara.FullName)" "STARTUP"
             if ($ManagedYara) { Copy-Item -Path $ManagedYara.FullName -Destination $DllDir -Force }
             if ($UnmanagedYara) {
                 Copy-Item -Path $UnmanagedYara.FullName -Destination $Amd64Dir -Force
@@ -2071,6 +2136,24 @@ try {
     $DllDir = Split-Path $ActualDllPath -Parent
     $SiblingDlls = Get-ChildItem -Path $DllDir -Filter "*.dll" | Where-Object { $_.Name -notmatch "KernelTraceControl|msdia140|yara(?!\.NET)" }
 
+    $global:DeepSensor_DepDir = $DllDir
+    if (-not $global:DeepSensor_AssemblyResolveBound) {
+        $global:DeepSensor_AssemblyResolveHandler = [System.ResolveEventHandler] {
+            param($sender, $eventArgs)
+            try {
+                $simpleName = (New-Object System.Reflection.AssemblyName($eventArgs.Name)).Name
+                $candidate  = Join-Path $global:DeepSensor_DepDir "$simpleName.dll"
+                if (Test-Path $candidate) {
+                    return [System.Reflection.Assembly]::LoadFrom($candidate)
+                }
+            } catch { }
+            return $null
+        }
+        [System.AppDomain]::CurrentDomain.add_AssemblyResolve($global:DeepSensor_AssemblyResolveHandler)
+        $global:DeepSensor_AssemblyResolveBound = $true
+        Write-Diag "    [+] AssemblyResolve handler bound for $DllDir" "STARTUP"
+    }
+
     foreach ($dll in $SiblingDlls) {
         try { [System.Reflection.Assembly]::LoadFrom($dll.FullName) | Out-Null } catch {}
     }
@@ -2096,6 +2179,69 @@ try {
     Write-Diag "    [*] Bootstrapping unmanaged memory structures..." "STARTUP"
 
     [DeepVisibilitySensor]::ToolkitDirectory = $ScriptDir
+
+    $FixedYaraExclusions = @(
+        "C:\ProgramData\DeepSensor\Dependencies",
+        "C:\Temp\DeepSensor_APT_Tests"
+    )
+    $ConfigYaraExclusions = if ($IniConfig.ContainsKey("YaraExclusions") -and
+                                $IniConfig["YaraExclusions"]["ScanExcludePaths"]) {
+        $IniConfig["YaraExclusions"]["ScanExcludePaths"] -split ",\s*" |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    } else { @() }
+    foreach ($p in ($FixedYaraExclusions + $ConfigYaraExclusions)) {
+        [void][DeepVisibilitySensor]::YaraScanExcludedPaths.TryAdd($p.Trim(), [byte]0)
+    }
+    Write-Diag ("    [+] YARA file-scan exclusions seeded: {0} path(s)." -f `
+        ([DeepVisibilitySensor]::YaraScanExcludedPaths.Count)) "STARTUP"
+
+    # ----------------------------------------------------------------------
+    # Seed armed-mode response tiering from [ArmedMode] config.
+    # ----------------------------------------------------------------------
+    if ($IniConfig.ContainsKey("ArmedMode")) {
+        $am = $IniConfig["ArmedMode"]
+
+        if ($am["Tier1Threshold"]) { [DeepVisibilitySensor]::Tier1Threshold = [int]$am["Tier1Threshold"] }
+        if ($am["Tier2Threshold"]) { [DeepVisibilitySensor]::Tier2Threshold = [int]$am["Tier2Threshold"] }
+        if ($am["Tier3Threshold"]) { [DeepVisibilitySensor]::Tier3Threshold = [int]$am["Tier3Threshold"] }
+
+        if ($am["TrustBenignDelta"])         { [DeepVisibilitySensor]::TrustBenignDelta         = [int]$am["TrustBenignDelta"] }
+        if ($am["TrustTrustedDelta"])        { [DeepVisibilitySensor]::TrustTrustedDelta        = [int]$am["TrustTrustedDelta"] }
+        if ($am["TrustUnknownDelta"])        { [DeepVisibilitySensor]::TrustUnknownDelta        = [int]$am["TrustUnknownDelta"] }
+        if ($am["TrustHostileDelta"])        { [DeepVisibilitySensor]::TrustHostileDelta        = [int]$am["TrustHostileDelta"] }
+        if ($am["LineageBenignDelta"])       { [DeepVisibilitySensor]::LineageBenignDelta       = [int]$am["LineageBenignDelta"] }
+        if ($am["YaraHitDelta"])             { [DeepVisibilitySensor]::YaraHitDelta             = [int]$am["YaraHitDelta"] }
+        if ($am["RepeatActorPerAlertDelta"]) { [DeepVisibilitySensor]::RepeatActorPerAlertDelta = [int]$am["RepeatActorPerAlertDelta"] }
+        if ($am["MaxRepeatAlertsConsidered"]){ [DeepVisibilitySensor]::MaxRepeatAlertsConsidered = [int]$am["MaxRepeatAlertsConsidered"] }
+
+        # Severity weights map: "critical=100, high=70, medium=40, low=15, informational=0"
+        if ($am["SeverityWeights"]) {
+            foreach ($pair in ($am["SeverityWeights"] -split ",\s*")) {
+                $kv = $pair -split "="
+                if ($kv.Count -eq 2 -and $kv[1] -match '^-?\d+$') {
+                    [void][DeepVisibilitySensor]::SeverityWeights.TryAdd($kv[0].Trim(), [int]$kv[1].Trim())
+                }
+            }
+        }
+    }
+
+    if ($IniConfig.ContainsKey("ProcessExclusions")) {
+        $pe = $IniConfig["ProcessExclusions"]
+        foreach ($p in (($pe["BenignADSProcs"] -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            [void][DeepVisibilitySensor]::ProcessTrustClass.TryAdd($p, 3)
+        }
+        foreach ($p in (($pe["TrustedNoise"] -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            [void][DeepVisibilitySensor]::ProcessTrustClass.TryAdd($p, 2)
+        }
+    }
+
+    Write-Diag ("    [+] Armed-mode tiering: T1={0} T2={1} T3={2}, {3} trust class(es), {4} lineage(s), {5} severity weight(s)." -f `
+        ([DeepVisibilitySensor]::Tier1Threshold), `
+        ([DeepVisibilitySensor]::Tier2Threshold), `
+        ([DeepVisibilitySensor]::Tier3Threshold), `
+        ([DeepVisibilitySensor]::ProcessTrustClass.Count), `
+        ([DeepVisibilitySensor]::BenignLineages.Count), `
+        ([DeepVisibilitySensor]::SeverityWeights.Count)) "STARTUP"
 
     # Map the DLL path for the C# DllImport dynamically
     $SecureBinDir = Split-Path $ValidMlBinaryPath -Parent
@@ -2144,8 +2290,18 @@ try {
 
     Sync-YaraIntelligence
     $YaraRulesPath = if ($OfflineRepoPath) { Join-Path $OfflineRepoPath "yara_rules" } else { Join-Path $global:SecureStaging "yara_rules" }
-    [DeepVisibilitySensor]::InitializeYaraMatrices($YaraRulesPath)
     [DeepVisibilitySensor]::IsArmed = $ArmedMode.IsPresent
+
+    [DeepVisibilitySensor]::StartUserResolverWorker()
+    Write-Diag "    [*] User resolver worker started (deferred WMI off ETW thread)." "STARTUP"
+
+    if ($ArmedMode.IsPresent) {
+        Write-Diag "    [*] Armed Mode Active: Compiling YARA matrices and starting alert-driven scanner..." "STARTUP"
+        [DeepVisibilitySensor]::InitializeYaraMatrices($YaraRulesPath)
+        [DeepVisibilitySensor]::StartYaraWorkerAsync()
+    } else {
+        Write-Diag "    [*] Passive Mode: YARA matrices not compiled, worker not started." "STARTUP"
+    }
 
     # === APPLY MEMORY HARDENING IF ARMED ===
     if ($ArmedMode) {
@@ -2315,8 +2471,12 @@ if ($Background) {
     Clear-Host
 }
 
-$dumpRef = $null
-while ([DeepVisibilitySensor]::EventQueue.TryDequeue([ref]$dumpRef)) {
+$startupRef = $null
+while ([DeepVisibilitySensor]::EventQueue.TryDequeue([ref]$startupRef)) {
+    $startupEvt = try { $startupRef | ConvertFrom-Json } catch { $null }
+    if ($null -ne $startupEvt -and $startupEvt.Provider -eq "DiagLog") {
+        Write-Diag $startupEvt.Message "ENGINE"
+    }
 }
 
 Write-Diag "Binding Kernel ETW Trace Session..." "INFO"
@@ -2327,17 +2487,6 @@ $SensorBlinded = $false
 $LastPolicySync = Get-Date
 $lastLightGC = Get-Date
 $lastUebaCleanup = Get-Date
-
-$global:HistoricalAlerts = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-$global:HistoricalSuppressions = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-$HistoricalAlertsPath = "C:\ProgramData\DeepSensor\Data\HistoricalAlerts.dat"
-if (Test-Path $HistoricalAlertsPath) {
-    try {
-        Get-Content $HistoricalAlertsPath -Encoding UTF8 | ForEach-Object {
-            if (-not [string]::IsNullOrWhiteSpace($_)) { [void]$global:HistoricalAlerts.Add($_) }
-        }
-    } catch {}
-}
 
 if (-not $Background) {
     Draw-Dashboard -Events 0 -MlEvals 0 -Alerts 0 -EtwHealth "ONLINE" -MlHealth "Native DLL"
@@ -2656,21 +2805,22 @@ try {
 
         # BATCH SIEM FORWARDING (Actionable Alerts & Active Defense)
         if ($global:dataBatch.Count -gt 0) {
-            $success = Write-RawJsonl $LogPath ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress })
-            if ($success -or $global:dataBatch.Count -gt 2500) { $global:dataBatch.Clear() }
+            $batchPayload = ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
+            Write-RotatedJsonl -FilePath $LogPath -JsonPayload $batchPayload
+            $global:dataBatch.Clear()
         }
 
         if ($script:logBatch.Count -gt 0) {
-            $success = Write-RawJsonl $LogPath $script:logBatch
-            if ($success -or $script:logBatch.Count -gt 2500) { $script:logBatch.Clear() }
+            $logPayload = $script:logBatch -join "`r`n"
+            Write-RotatedJsonl -FilePath $LogPath -JsonPayload $logPayload
+            $script:logBatch.Clear()
         }
 
         # BATCH UEBA FORWARDING (Learning & Suppressions)
         if ($script:uebaBatch.Count -gt 0) {
-            $success = Write-RawJsonl $UebaLogPath $script:uebaBatch
-            if ($success -or $script:uebaBatch.Count -gt 5000) {
-                $script:uebaBatch.Clear()
-            }
+            $uebaPayload = $script:uebaBatch -join "`r`n"
+            Write-RotatedJsonl -FilePath $UebaLogPath -JsonPayload $uebaPayload
+            $script:uebaBatch.Clear()
         }
 
         # === DEEP MEMORY RECLAMATION: LOH COMPACTION (every 60 seconds) ===
@@ -2783,9 +2933,25 @@ try {
 
     Write-Host "    [*] Finalizing Kernel Telemetry & ML Database..." -ForegroundColor Gray
     try {
+        if ($null -ne $global:dataBatch -and $global:dataBatch.Count -gt 0 -and $null -ne $global:LogFile) {
+            $batchOutput = ($global:dataBatch | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join "`r`n"
+            try { [System.IO.File]::AppendAllText($global:LogFile, $batchOutput + "`r`n") } catch { }
+        }
+
         [DeepVisibilitySensor]::StopSession()
         [DeepVisibilitySensor]::TeardownEngine()
-    } catch { Write-Host "        [-] Engine Teardown Error: $($_.Exception.Message)" -ForegroundColor DarkRed }
+    } catch {
+        Write-Diag "StopSession error (non-fatal): $($_.Exception.Message)" "WARN"
+    }
+    Write-Diag "C# TraceEvent Session halted and Rust FFI pointer freed." "INFO"
+
+    if ($global:DeepSensor_AssemblyResolveBound) {
+        try {
+            [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($global:DeepSensor_AssemblyResolveHandler)
+            $global:DeepSensor_AssemblyResolveBound = $false
+            Write-Diag "AssemblyResolve handler unbound." "INFO"
+        } catch { }
+    }
 
     Write-Host "    [*] Unlocking project directory permissions..." -ForegroundColor Gray
     try {

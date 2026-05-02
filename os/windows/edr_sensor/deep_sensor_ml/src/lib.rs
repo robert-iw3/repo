@@ -73,8 +73,7 @@ use extended_isolation_forest::{Forest, ForestOptions};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{Mutex, Arc, RwLock};
-use std::panic;
-use std::backtrace::Backtrace;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::fs::OpenOptions;
 use std::io::Write;
 use tokio::sync::mpsc;
@@ -84,6 +83,9 @@ use serde_json::Value;
 // ============================================================================
 // DATA STRUCTURES
 // ============================================================================
+
+pub type NativeLogCallback = extern "C" fn(*const std::os::raw::c_char);
+pub static LOG_CALLBACK: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 #[derive(Deserialize, Debug, Clone)]
 struct IncomingEvent {
@@ -335,6 +337,25 @@ impl BehavioralEngine {
             [],
         ).unwrap();
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS DeepLedger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT,
+                timestamp TEXT,
+                computer_name TEXT,
+                host_ip TEXT,
+                sensor_user TEXT,
+                event_type TEXT,
+                process TEXT,
+                command_line TEXT,
+                alert_reason TEXT,
+                confidence REAL,
+                action TEXT,
+                payload TEXT
+            )",
+            [],
+        ).unwrap();
+
         let _ = conn.execute_batch("
             PRAGMA wal_checkpoint(FULL);
             PRAGMA optimize;
@@ -343,14 +364,14 @@ impl BehavioralEngine {
 
         let (tx, rx) = mpsc::channel(15000);
         let rt = Runtime::new().unwrap();
-
         let config_path = r"C:\ProgramData\DeepSensor\DeepSensor_Config.ini".to_string();
+
         rt.spawn(async move {
             transmission::start_transmission_worker(config_path, rx, |msg| {
-                let log_path = r"C:\ProgramData\DeepSensor\Logs\Transmission_Diag.log";
+                let log_path = r"C:\ProgramData\DeepSensor\Logs\DeepSensor_Diagnostic.log";
                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
                 if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                    let _ = writeln!(file, "[{}] {}", ts, msg);
+                    let _ = writeln!(file, "[{}] [TRANSMISSION] {}", ts, msg);
                 }
             }).await;
         });
@@ -866,24 +887,15 @@ impl BehavioralEngine {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn init_engine() -> *mut Mutex<BehavioralEngine> {
-    panic::set_hook(Box::new(|panic_info| {
-        let backtrace = Backtrace::force_capture();
-        let msg = match panic_info.payload().downcast_ref::<&'static str>() {
-            Some(s) => *s,
-            None => match panic_info.payload().downcast_ref::<String>() {
-                Some(s) => &s[..],
-                None => "Unknown Rust Panic",
-            }
-        };
+pub extern "C" fn init_engine(log_cb: Option<NativeLogCallback>) -> *mut Mutex<BehavioralEngine> {
+    if let Some(cb) = log_cb {
+        LOG_CALLBACK.store(cb as *mut _, Ordering::SeqCst);
+    }
 
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("C:\\ProgramData\\DeepSensor\\Logs\\Rust_Fatal.log") {
-            let _ = writeln!(file, "PANIC: {}\nLOCATION: {:?}\nBACKTRACE:\n{}", msg, panic_info.location(), backtrace);
-        }
-    }));
-
-    let engine = BehavioralEngine::new();
-    Box::into_raw(Box::new(Mutex::new(engine)))
+    std::panic::catch_unwind(|| {
+        let engine = BehavioralEngine::new();
+        Box::into_raw(Box::new(Mutex::new(engine)))
+    }).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -944,12 +956,6 @@ pub extern "C" fn evaluate_telemetry(
         Ok(alerts) if !alerts.is_empty() => {
             let response = OutgoingResponse { alerts: Some(alerts.clone()), daemon_error: None };
 
-            for alert in &alerts {
-                if let Ok(json_val) = serde_json::to_value(alert) {
-                    let _ = engine_mutex.lock().unwrap().tx.try_send(json_val);
-                }
-            }
-
             match serde_json::to_string(&response) {
                 Ok(resp_str) => CString::new(resp_str)
                     .unwrap_or_else(|_| CString::new(r#"{"daemon_error":"serialize_failed"}"#).unwrap())
@@ -969,18 +975,136 @@ pub extern "C" fn free_string(s: *mut c_char) {
 }
 
 #[no_mangle]
+pub extern "C" fn submit_orchestrator_alert(engine_ptr: *mut Mutex<BehavioralEngine>, json_payload: *const c_char) {
+    if engine_ptr.is_null() || json_payload.is_null() { return; }
+
+    let _ = std::panic::catch_unwind(|| {
+        let c_str = unsafe { CStr::from_ptr(json_payload) };
+        if let Ok(json_str) = c_str.to_str() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let engine_mutex = unsafe { &*engine_ptr };
+                let engine = match engine_mutex.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+
+                let event_id = val.get("EventID").and_then(|v| v.as_str()).unwrap_or_default();
+                let timestamp = val.get("Timestamp_UTC").and_then(|v| v.as_str()).unwrap_or_default();
+                let computer_name = val.get("ComputerName").and_then(|v| v.as_str()).unwrap_or_default();
+                let host_ip = val.get("HostIP").and_then(|v| v.as_str()).unwrap_or_default();
+                let sensor_user = val.get("SensorUser").and_then(|v| v.as_str()).unwrap_or_default();
+                let event_type = val.get("EventType").and_then(|v| v.as_str()).unwrap_or_default();
+                let process = val.get("Image").and_then(|v| v.as_str()).unwrap_or_default();
+                let command_line = val.get("CommandLine").and_then(|v| v.as_str()).unwrap_or_default();
+                let alert_reason = val.get("SuspiciousFlags").and_then(|v| v.as_str()).unwrap_or_default();
+                let confidence = val.get("Confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let action = val.get("Action").and_then(|v| v.as_str()).unwrap_or_default();
+
+                let _ = engine.conn.execute(
+                    "INSERT INTO DeepLedger (
+                        event_id,
+                        timestamp,
+                        computer_name,
+                        host_ip,
+                        sensor_user,
+                        event_type,
+                        process,
+                        command_line,
+                        alert_reason,
+                        confidence,
+                        action,
+                        payload
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        event_id,
+                        timestamp,
+                        computer_name,
+                        host_ip,
+                        sensor_user,
+                        event_type,
+                        process,
+                        command_line,
+                        alert_reason,
+                        confidence,
+                        action,
+                        json_str
+                    ],
+                );
+
+                let _ = engine.tx.try_send(val);
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn submit_ueba_audit(engine_ptr: *mut Mutex<BehavioralEngine>, json_payload: *const c_char) {
+    if engine_ptr.is_null() || json_payload.is_null() { return; }
+
+    let _ = std::panic::catch_unwind(|| {
+        let c_str = unsafe { CStr::from_ptr(json_payload) };
+        if let Ok(json_str) = c_str.to_str() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let engine_mutex = unsafe { &*engine_ptr };
+                let engine = match engine_mutex.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+
+                let ctx_hash = val.get("context_hash").and_then(|v| v.as_str()).unwrap_or_default();
+                let user_ctx = val.get("user_context").or_else(|| val.get("user")).and_then(|v| v.as_str()).unwrap_or_default();
+                let parent = val.get("parent_process").and_then(|v| v.as_str()).unwrap_or_default();
+                let process = val.get("process").and_then(|v| v.as_str()).unwrap_or_default();
+                let rule = val.get("rule").and_then(|v| v.as_str()).unwrap_or_default();
+                let target = val.get("target_struct").and_then(|v| v.as_str()).unwrap_or_default();
+
+                let count = val.get("event_count").and_then(|v| v.as_i64()).unwrap_or(1);
+                let last_seen = val.get("last_seen").and_then(|v| v.as_f64()).unwrap_or_default();
+                let mean_delta = val.get("mean_delta").and_then(|v| v.as_f64()).unwrap_or_default();
+                let m2_delta = val.get("m2_delta").and_then(|v| v.as_f64()).unwrap_or_default();
+                let mean_entropy = val.get("mean_entropy").and_then(|v| v.as_f64()).unwrap_or_default();
+
+                let _ = engine.conn.execute(
+                    "INSERT INTO ueba_temporal_baselines (
+                        context_hash,
+                        user_context,
+                        parent_process,
+                        process,
+                        rule,
+                        target_struct,
+                        event_count,
+                        last_seen,
+                        mean_delta,
+                        m2_delta,
+                        mean_entropy
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    ON CONFLICT(context_hash) DO UPDATE SET
+                        event_count = excluded.event_count,
+                        last_seen = excluded.last_seen,
+                        mean_delta = excluded.mean_delta,
+                        m2_delta = excluded.m2_delta,
+                        mean_entropy = excluded.mean_entropy",
+                    rusqlite::params![
+                        ctx_hash, user_ctx, parent, process, rule, target,
+                        count, last_seen, mean_delta, m2_delta, mean_entropy
+                    ],
+                );
+            }
+        }
+    });
+}
+
+#[no_mangle]
 pub extern "C" fn teardown_engine(engine_ptr: *mut Mutex<BehavioralEngine>) {
     if !engine_ptr.is_null() {
         unsafe {
             let engine_box = Box::from_raw(engine_ptr);
-            let engine = match engine_box.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    eprintln!("[ML TEARDOWN] Mutex was poisoned - recovering");
-                    poisoned.into_inner()
-                }
-            };
-            let _ = engine.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            {
+                let mut engine = match engine_box.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner()
+                };
+
+                let _ = engine.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+                let dummy_tx = mpsc::channel(1).0;
+                let _old_tx = std::mem::replace(&mut engine.tx, dummy_tx);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 }
