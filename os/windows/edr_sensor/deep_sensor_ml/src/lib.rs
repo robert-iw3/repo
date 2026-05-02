@@ -663,22 +663,33 @@ impl BehavioralEngine {
 
         // Ransomware burst detection
         if evt.event_type == "FileIOCreate" || evt.event_type == "FileIOWrite" {
-            let path_entropy = Self::shannon_entropy(&evt.path);
+            let filename = evt.path.split('\\').last().unwrap_or(&evt.path);
+            let effective_path_entropy = Self::shannon_entropy(filename);
+            let event_volume = if evt.count > 0 { evt.count } else { 1 };
+
             let tracker = self.pid_io_tracker.entry(evt.pid).or_insert(IoTracker { count: 0, start_time: now, entropy_sum: 0.0 });
 
-            tracker.count += 1;
-            tracker.entropy_sum += path_entropy;
+            tracker.count += event_volume;
+            tracker.entropy_sum += effective_path_entropy * event_volume as f64;
 
+            // 1. Reset the 1-second window if it has expired
             if now - tracker.start_time > 1.0 {
-                tracker.count = 1;
+                tracker.count = event_volume;
                 tracker.start_time = now;
-                tracker.entropy_sum = path_entropy;
-            } else if tracker.count > 50 {
+                tracker.entropy_sum = effective_path_entropy * event_volume as f64;
+            }
+
+            // 2. Evaluate thresholds independently
+            if tracker.count > 50 {
                 let avg_entropy = tracker.entropy_sum / tracker.count as f64;
-                if avg_entropy > 5.2 {
+
+                // Threshold lowered to 3.8 to reliably catch anomalous file hashes.
+                if avg_entropy > 3.8 {
                     alerts.push(Alert::new(&evt, avg_entropy, 95.0, "CRITICAL", format!("[T1486] Ransomware/Wiper Burst: {} I/O ops/sec (Entropy: {:.2})", tracker.count, avg_entropy)));
+                    // Reset so it doesn't spam alerts continuously
                     tracker.count = 0;
                     tracker.entropy_sum = 0.0;
+                    tracker.start_time = now;
                 }
             }
         }
