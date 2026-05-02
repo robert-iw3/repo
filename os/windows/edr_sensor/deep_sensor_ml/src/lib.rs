@@ -304,13 +304,33 @@ pub struct BehavioralEngine {
     pub rt: Runtime,
 }
 
+fn emit_log(msg: &str) {
+    use std::sync::atomic::Ordering;
+    let cb_ptr = LOG_CALLBACK.load(Ordering::SeqCst);
+    if cb_ptr.is_null() { return; }
+    let cb: NativeLogCallback = unsafe { std::mem::transmute(cb_ptr) };
+    if let Ok(c_str) = std::ffi::CString::new(msg) {
+        cb(c_str.as_ptr());
+    }
+}
+
 impl BehavioralEngine {
     fn new() -> Self {
         let secure_dir = r"C:\ProgramData\DeepSensor\Data";
         std::fs::create_dir_all(secure_dir).unwrap_or_default();
         let db_path = format!(r"{}\DeepSensor_UEBA.db", secure_dir);
 
-        let conn = Connection::open(&db_path).unwrap_or_else(|_| Connection::open_in_memory().unwrap());
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                emit_log(&format!(
+                    "[ML ENGINE] WARNING: SQLite on-disk open failed ({}); falling back to :memory:. UEBA baselines will NOT persist across restarts.",
+                    e
+                ));
+                Connection::open_in_memory().expect("in-memory SQLite open failed -- cannot continue")
+            }
+        };
+
         conn.execute_batch("
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;

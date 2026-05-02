@@ -126,7 +126,9 @@ public class DeepVisibilitySensor {
                     _deviceMap[sb.ToString()] = d;
                 }
             }
-        } catch { }
+        } catch (Exception ex) {
+            EnqueueDiag($"[INIT ERROR] InitializePathMap failed: {ex.Message}");
+        }
     }
 
     public static string ResolveDosPath(string ntPath) {
@@ -247,7 +249,7 @@ public class DeepVisibilitySensor {
         public string[] ExcludeActors = Array.Empty<string>();
     }
 
-    public struct TtpRuleMatrix {
+    public class TtpRuleMatrix {
         public HighFidelityTTPRule[] ProcRules;
         public HighFidelityTTPRule[] FileRules;
         public HighFidelityTTPRule[] RegRules;
@@ -689,6 +691,62 @@ public class DeepVisibilitySensor {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // Metrics emitter -- periodic data-fidelity snapshot. Called by the
+    // launcher orchestrator on its existing 60s canary cadence (no new
+    // timers/threads). Reads existing Interlocked counters, computes deltas
+    // against the prior snapshot in place, emits a single diag line.
+    //
+    // Output line format:
+    //   [METRICS] events/min=N alerts/min=N tier1=N tier2=N tier3=N \
+    //             tier0_suppressed=N ml_evals/min=N events_lost=N \
+    //             ml_queue=N yara_queue=N
+    //
+    // Drop-rate visibility:
+    //   - events_lost  -> kernel buffers overflowed (sensor too slow)
+    //   - ml_queue near 2000 -> ML engine can't drain fast enough
+    //   - yara_queue near 2000 -> YARA worker behind
+    // ----------------------------------------------------------------------
+    private static long _metricsLastEvents = 0;
+    private static long _metricsLastAlerts = 0;
+    private static long _metricsLastT1 = 0;
+    private static long _metricsLastT2 = 0;
+    private static long _metricsLastT3 = 0;
+    private static long _metricsLastT0 = 0;
+    private static long _metricsLastMlEvals = 0;
+    private static int  _metricsLastEventsLost = 0;
+
+    public static void EmitMetricsLine() {
+        long curEvents     = Interlocked.Read(ref TotalEventsParsed);
+        long curAlerts     = Interlocked.Read(ref TotalAlertsGenerated);
+        long curT1         = Interlocked.Read(ref TotalAlertsTier1);
+        long curT2         = Interlocked.Read(ref TotalAlertsTier2);
+        long curT3         = Interlocked.Read(ref TotalAlertsTier3);
+        long curT0         = Interlocked.Read(ref TotalAlertsTier0Suppressed);
+        long curMlEvals    = Interlocked.Read(ref TotalMlEvals);
+        int  curEventsLost = (_session != null) ? _session.EventsLost : _metricsLastEventsLost;
+
+        long dEvents  = curEvents  - _metricsLastEvents;
+        long dAlerts  = curAlerts  - _metricsLastAlerts;
+        long dT1      = curT1      - _metricsLastT1;
+        long dT2      = curT2      - _metricsLastT2;
+        long dT3      = curT3      - _metricsLastT3;
+        long dT0      = curT0      - _metricsLastT0;
+        long dMlEvals = curMlEvals - _metricsLastMlEvals;
+        int  dLost    = curEventsLost - _metricsLastEventsLost;
+
+        _metricsLastEvents     = curEvents;
+        _metricsLastAlerts     = curAlerts;
+        _metricsLastT1         = curT1;
+        _metricsLastT2         = curT2;
+        _metricsLastT3         = curT3;
+        _metricsLastT0         = curT0;
+        _metricsLastMlEvals    = curMlEvals;
+        _metricsLastEventsLost = curEventsLost;
+
+        EnqueueDiag($"[METRICS] events/min={dEvents} alerts/min={dAlerts} tier1={dT1} tier2={dT2} tier3={dT3} tier0_suppressed={dT0} ml_evals/min={dMlEvals} events_lost={dLost} ml_queue={_mlWorkQueue.Count} yara_queue={_yaraScanQueue.Count}");
+    }
+
     private static ConcurrentDictionary<string, long> _yaraRecentlyRequested =
         new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     private const long _yaraRecentTtlTicks = 300_000_000L; // 30s in 100ns ticks
@@ -853,15 +911,37 @@ public class DeepVisibilitySensor {
                 }
             }
             return true;
-        } catch { return true; } finally { CloseHandle(hProcess); }
+        } catch {
+            return true;
+        } finally { CloseHandle(hProcess); }
     }
 
-    // EXHAUSTIVE ANTI-BSOD LIST: Touching these will cause system instability or immediate bugchecks
-    private static readonly HashSet<string> CriticalSystemProcesses = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
-        "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
-        "lsass.exe", "winlogon.exe", "svchost.exe", "lsm.exe",
-        "spoolsv.exe", "explorer.exe", "taskhostw.exe", "System"
-    };
+    // EXHAUSTIVE ANTI-BSOD LIST: Touching these will cause system instability or
+    // immediate bugchecks. Seeded with hardcoded defaults so a missing or
+    // misconfigured config.ini does NOT silently drop anti-BSOD coverage. The
+    // launcher additively augments via [ProcessExclusions] CriticalSystemProcesses.
+    public static ConcurrentDictionary<string, byte> CriticalSystemProcesses =
+        new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase) {
+            ["smss.exe"]      = 0, ["csrss.exe"]    = 0, ["wininit.exe"] = 0,
+            ["services.exe"]  = 0, ["lsass.exe"]    = 0, ["winlogon.exe"] = 0,
+            ["svchost.exe"]   = 0, ["lsm.exe"]      = 0, ["spoolsv.exe"] = 0,
+            ["explorer.exe"]  = 0, ["taskhostw.exe"]= 0, ["System"]       = 0,
+        };
+
+    // Process names whose RWX allocations are legitimate JIT-compiled code.
+    // Flipping these regions to PAGE_NOACCESS or freezing their threads
+    // crashes the target. Quarantine dump may still proceed for forensic
+    // value, but invasive actions are unconditionally suppressed for these.
+    // Default-seeded; launcher additively augments via [ProcessExclusions]
+    // JitRuntimeProcesses.
+    public static ConcurrentDictionary<string, byte> JitRuntimeProcesses =
+        new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase) {
+            ["chrome.exe"]    = 0, ["msedge.exe"]   = 0, ["msedgewebview2.exe"] = 0,
+            ["firefox.exe"]   = 0, ["node.exe"]     = 0, ["Code.exe"]           = 0,
+            ["devenv.exe"]    = 0, ["javaw.exe"]    = 0, ["java.exe"]           = 0,
+            ["powershell.exe"]= 0, ["pwsh.exe"]     = 0, ["dotnet.exe"]         = 0,
+            ["w3wp.exe"]      = 0,
+        };
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
@@ -910,7 +990,14 @@ public class DeepVisibilitySensor {
     public static bool QuarantineNativeThread(int tid, int pid) {
         if (!IsArmed) return false;
         string procName = GetProcessName(pid);
-        if (CriticalSystemProcesses.Contains(procName)) return false;
+        if (CriticalSystemProcesses.ContainsKey(procName)) return false;
+
+        // JIT runtime exclusion -- legitimate RWX, freezing a thread inside
+        // chrome.exe / V8 / CLR / Java causes target-process hang or crash.
+        if (JitRuntimeProcesses.ContainsKey(procName)) {
+            EnqueueDiag($"[ANTI-CRASH] SuspendThread suppressed for JIT runtime PID {pid} ({procName}).");
+            return false;
+        }
 
         int score = ScoreAlert("critical", procName, "", pid, true);
         if (TierFromScore(score) < ResponseTier.Respond) {
@@ -922,15 +1009,25 @@ public class DeepVisibilitySensor {
         IntPtr hThread = OpenThread(THREAD_SUSPEND_RESUME, false, (uint)tid);
         if (hThread == IntPtr.Zero) return false;
 
-        uint suspendCount = SuspendThread(hThread);
-        CloseHandle(hThread);
-        return (suspendCount != 0xFFFFFFFF);
+        try {
+            string nowName = GetProcessName(pid);
+            if (CriticalSystemProcesses.ContainsKey(nowName) || JitRuntimeProcesses.ContainsKey(nowName)) {
+                EnqueueDiag($"[ANTI-BSOD] PID {pid} re-resolved to {nowName} between trust-check and freeze; suspending aborted.");
+                return false;
+            }
+
+            uint suspendCount = SuspendThread(hThread);
+            return (suspendCount != 0xFFFFFFFF);
+        }
+        finally {
+            CloseHandle(hThread);
+        }
     }
 
     public static string NeuterAndDumpPayload(int pid, ulong address, ulong size) {
         string yaraResult = "NoSignatureMatch";
         string procName = GetProcessName(pid);
-        if (CriticalSystemProcesses.Contains(procName)) return yaraResult;
+        if (CriticalSystemProcesses.ContainsKey(procName)) return yaraResult;
 
         if (size > 52428800) return "AllocationExceedsScanLimit";
 
@@ -949,8 +1046,17 @@ public class DeepVisibilitySensor {
                     string dumpPath = $@"{quarantineDir}\Payload_{procName}_{pid}_0x{address:X}.bin";
                     System.IO.File.WriteAllBytes(dumpPath, buffer);
 
-                    uint PAGE_NOACCESS = 0x01;
-                    VirtualProtectEx(hProcess, (IntPtr)address, (UIntPtr)size, PAGE_NOACCESS, out uint oldProtect);
+                    int score = ScoreAlert("critical", procName, "", pid, true);
+                    ResponseTier tier = TierFromScore(score);
+
+                    if (JitRuntimeProcesses.ContainsKey(procName)) {
+                        EnqueueDiag($"[ANTI-CRASH] VirtualProtectEx suppressed for JIT runtime PID {pid} ({procName}); quarantine dump written.");
+                    } else if (tier < ResponseTier.Respond) {
+                        EnqueueDiag($"[TIER] Score={score} below Tier3; VirtualProtectEx suppressed for PID {pid} ({procName}); quarantine dump written.");
+                    } else {
+                        uint PAGE_NOACCESS = 0x01;
+                        VirtualProtectEx(hProcess, (IntPtr)address, (UIntPtr)size, PAGE_NOACCESS, out uint oldProtect);
+                    }
                 }
             }
         } catch (Exception ex) { EnqueueDiag($"[ACTIVE DEFENSE ERROR] Memory dump failed: {ex.Message}"); return "ForensicError"; } finally { CloseHandle(hProcess); }
@@ -984,11 +1090,15 @@ public class DeepVisibilitySensor {
         uint THREAD_SUSPEND_RESUME = 0x0002;
         IntPtr hThread = OpenThread(THREAD_SUSPEND_RESUME, false, (uint)tid);
         if (hThread == IntPtr.Zero) return false;
-        uint resumeCount = ResumeThread(hThread);
-        CloseHandle(hThread);
 
-        // If resumeCount is > 0, it successfully decremented the suspension count
-        return (resumeCount != 0xFFFFFFFF);
+        try {
+            uint resumeCount = ResumeThread(hThread);
+            // If resumeCount is > 0, it successfully decremented the suspension count
+            return (resumeCount != 0xFFFFFFFF);
+        }
+        finally {
+            CloseHandle(hThread);
+        }
     }
 
     private static readonly string[] MonitoredRegPaths = {
@@ -1173,13 +1283,14 @@ public class DeepVisibilitySensor {
                 }
             }
 
-            _ttpMatrix = new TtpRuleMatrix {
+            var newTtpMatrix = new TtpRuleMatrix {
                 ProcRules = procList.ToArray(),
                 FileRules = fileList.ToArray(),
                 RegRules = regList.ToArray(),
                 ImgRules = imgList.ToArray(),
                 WmiRules = wmiList.ToArray()
             };
+            Interlocked.Exchange(ref _ttpMatrix, newTtpMatrix);
         } catch (Exception ex) { EnqueueDiag($"[TTP COMPILER ERROR] Failed to parse TTP matrix: {ex.Message}"); }
     }
 
@@ -1210,6 +1321,22 @@ public class DeepVisibilitySensor {
     }
 
     private static UebaAggregator _aggregator = new UebaAggregator();
+
+    private static string BuildLightJson(
+        string category, string eventType, string process, string parentProcess,
+        int pid, int parentPid, int tid, string cmdline, string path)
+    {
+        string procLower = process.ToLowerInvariant();
+        string parentLower = parentProcess.ToLowerInvariant();
+
+        string lineageKey = parentProcess + "|" + process;
+        if (BenignLineages.ContainsKey(lineageKey)) return null;
+        if (BenignADSProcesses.Contains(procLower) || BenignADSProcesses.Contains(parentLower)) return null;
+
+        string eventUser = GetEventUser(pid);
+
+        return $"{{\"Category\":\"{category}\",\"Type\":\"{eventType}\",\"Process\":\"{JsonEscape(process)}\",\"Parent\":\"{JsonEscape(parentProcess)}\",\"PID\":{pid},\"ParentPID\":{parentPid},\"TID\":{tid},\"Cmd\":\"{JsonEscape(cmdline)}\",\"Path\":\"{JsonEscape(path)}\",\"ComputerName\":\"{HostComputerName}\",\"SensorUser\":\"{SensorUser}\",\"EventUser\":\"{JsonEscape(eventUser)}\"}}";
+    }
 
     private static string BuildEnrichedJson(
         string category, string eventType, string process, string parentProcess,
@@ -1288,7 +1415,12 @@ public class DeepVisibilitySensor {
         }
 
         foreach (var p in System.Diagnostics.Process.GetProcesses()) {
-            try { ProcessCache[p.Id] = p.ProcessName + ".exe"; } catch { }
+            try {
+                ProcessCache[p.Id] = p.ProcessName + ".exe";
+            } catch {
+                // INTENTIONAL SILENT CATCH: GetProcesses() will hit Access Denied
+                // on elevated or protected processes when running as a standard admin.
+            }
         }
 
         BenignExplorerValueNames = new HashSet<string>(benignExplorerValues, StringComparer.OrdinalIgnoreCase);
@@ -1439,8 +1571,8 @@ public class DeepVisibilitySensor {
                 // We bind it to powershell.exe and the specific PID/TID that executed it.
                 EnqueueRaw("ScriptBlock", "powershell.exe", "", "", scriptPayload, data.ProcessID, data.ThreadID);
             }
-        } catch {
-            // Fail open: Never crash the sensor if a diagnostic payload is malformed
+        } catch (Exception ex) {
+            EnqueueDiag($"[ETW ERROR] ParsePowerShellScriptBlock failed: {ex.Message}");
         }
     }
 
@@ -1476,7 +1608,11 @@ public class DeepVisibilitySensor {
                             StringBuilder sb = new StringBuilder();
                             if (data.PayloadNames != null) {
                                 foreach (string key in data.PayloadNames) {
-                                    try { sb.Append($"{data.PayloadString(data.PayloadIndex(key))} "); } catch { }
+                                    try { sb.Append($"{data.PayloadString(data.PayloadIndex(key))} "); }
+                                    catch {
+                                        // INTENTIONAL SILENT CATCH: Corrupt ETW packet or mismatched schema.
+                                        // Logging this per-field would saturate the queue.
+                                    }
                                 }
                             }
                             string dynamicPayload = sb.ToString();
@@ -1488,7 +1624,10 @@ public class DeepVisibilitySensor {
                                 if (!string.IsNullOrEmpty(cpidStr) && int.TryParse(cpidStr, out int p)) {
                                     actorPid = p;
                                 }
-                            } catch { }
+                            } catch {
+                                // INTENTIONAL SILENT CATCH: Not all WMI events contain a 'ClientProcessId' field.
+                                // Throwing/logging here would DoS the diagnostic queue on normal ambient WMI noise.
+                            }
 
                             string actorName = GetProcessName(actorPid);
                             if (actorPid == SensorPid) return;
@@ -1569,7 +1708,7 @@ public class DeepVisibilitySensor {
         EnqueueDiag($"TraceEventSession bound: {sessionName}");
 
         var kernelKeywords = KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.Registry |
-            KernelTraceEventParser.Keywords.FileIOInit | KernelTraceEventParser.Keywords.FileIO |
+            KernelTraceEventParser.Keywords.FileIOInit |
             KernelTraceEventParser.Keywords.ImageLoad | KernelTraceEventParser.Keywords.Memory |
             KernelTraceEventParser.Keywords.NetworkTCPIP;
 
@@ -2093,17 +2232,6 @@ public class DeepVisibilitySensor {
             } catch (Exception ex) { EnqueueDiag($"[ETW ERROR] FileIOCreate parsing failed: {ex.Message}"); }
         };
 
-        _session.Source.Kernel.FileIOWrite += delegate (FileIOReadWriteTraceData data) {
-            if (data.ProcessID == SensorPid) return;
-
-            string path = ResolveDosPath(data.FileName ?? "");
-            if (!string.IsNullOrEmpty(ToolkitDirectory) && path.IndexOf(ToolkitDirectory, StringComparison.OrdinalIgnoreCase) >= 0) {
-                return;
-            }
-
-            EnqueueRaw("FileIOWrite", GetProcessName(data.ProcessID), "", path, "", data.ProcessID, data.ThreadID);
-        };
-
         _session.Source.Kernel.VirtualMemAlloc += delegate (VirtualAllocTraceData data) {
             int flags = (int)data.Flags;
 
@@ -2135,7 +2263,7 @@ public class DeepVisibilitySensor {
             int heartbeatCounter = 0;
 
             while (IsSessionHealthy()) {
-                await Task.Delay(2000); // Check every 2 seconds
+                await Task.Delay(10000); // Check every 10 seconds
 
                 if (_session != null && _session.EventsLost > _lastEventsLost) {
                     int dropped = _session.EventsLost - _lastEventsLost;
@@ -2163,75 +2291,6 @@ public class DeepVisibilitySensor {
         try { return _session.Source != null; } catch { return false; }
     }
 
-    public static void StopSession() {
-        if (_session != null) {
-            Task.Run(() => {
-                try {
-                    _session.Stop();
-                    _session.Dispose();
-                } catch { }
-            }).Wait(1000);
-            _session = null;
-        }
-
-        Task.Run(() => {
-            try {
-                // Query the OS for all currently running ETW trace sessions
-                var activeSessions = TraceEventSession.GetActiveSessionNames();
-                var sessionsToKill = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                // Add the Kernel Logger if it is currently running
-                string kernelSession = KernelTraceEventParser.KernelSessionName;
-                if (activeSessions.Contains(kernelSession)) {
-                    sessionsToKill.Add(kernelSession);
-                }
-
-                // Add ANY session that starts with "DeepSensor" (Catches UserMode, leaks, etc.)
-                foreach (string sessionName in activeSessions) {
-                    if (sessionName.StartsWith("DeepSensor", StringComparison.OrdinalIgnoreCase)) {
-                        sessionsToKill.Add(sessionName);
-                    }
-                }
-
-                // Execute targeted teardown
-                foreach (string targetSession in sessionsToKill) {
-                    try {
-                        using (var orphaned = new TraceEventSession(targetSession)) {
-                            orphaned.Stop(true); // true = forceful stop
-                        }
-                    } catch {
-                        // Silently swallow access/not-found errors during teardown
-                    }
-                }
-            } catch { }
-        }).Wait(2000); // Allow up to 2 seconds for kernel objects to release
-
-        if (_umThread != null && _umThread.IsAlive) {
-            _umThread.Join(500);
-        }
-    }
-
-    public static void TeardownEngine() {
-        _mlWorkQueue.CompleteAdding();
-        try { _yaraScanQueue.CompleteAdding(); } catch {}
-        try { _yaraCts.Cancel(); } catch {}
-        _mlCancelSource.Cancel();
-
-        if (_mlConsumerTask != null) { _mlConsumerTask.Wait(2000); }
-
-        if (_mlEnginePtr != IntPtr.Zero) {
-            teardown_engine(_mlEnginePtr);
-            _mlEnginePtr = IntPtr.Zero;
-            EnqueueDiag("[ML ENGINE] Native Rust DLL safely unloaded and DB flushed.");
-        }
-
-        foreach (var rules in YaraMatrices.Values) {
-            try { rules.Dispose(); } catch {}
-        }
-        YaraMatrices.Clear();
-        if (_yaraContext != null) { _yaraContext.Dispose(); _yaraContext = null; }
-    }
-
     private static string GetProcessName(int pid) {
         return ProcessCache.ContainsKey(pid) ? ProcessCache[pid] : pid.ToString();
     }
@@ -2251,27 +2310,47 @@ public class DeepVisibilitySensor {
         Task.Run(() => {
             try {
                 foreach (int pid in _userResolveQueue.GetConsumingEnumerable(_mlCancelSource.Token)) {
-                    if (ProcessUserCache.ContainsKey(pid)) continue; // already resolved by an earlier dequeue
+                    if (ProcessUserCache.ContainsKey(pid)) continue;
 
                     string user = "UNKNOWN";
+                    bool processExited = false;
+
                     try {
-                        using (var searcher = new System.Management.ManagementObjectSearcher(
-                            $"Select * From Win32_Process Where ProcessID = {pid}")) {
-                            foreach (System.Management.ManagementObject mo in searcher.Get()) {
-                                string[] ownerInfo = new string[2];
-                                mo.InvokeMethod("GetOwner", (object[])ownerInfo);
-                                if (ownerInfo[0] != null) {
-                                    user = string.IsNullOrWhiteSpace(ownerInfo[1])
-                                        ? ownerInfo[0]
-                                        : $"{ownerInfo[1]}\\{ownerInfo[0]}";
-                                }
-                                break;
-                            }
+                        using (var p = System.Diagnostics.Process.GetProcessById(pid)) {
+                            // Process exists; fall through to WMI path
                         }
                     }
-                    catch (Exception ex) {
-                        user = "NT AUTHORITY\\SYSTEM";
-                        EnqueueDiag($"[USER RESOLVER] WMI lookup failed for PID {pid}: {ex.Message}");
+                    catch (ArgumentException) {
+                        // No such PID currently running -- short-lived process.
+                        processExited = true;
+                    }
+                    catch { /* fall through to WMI; will surface a real error if any */ }
+
+                    if (processExited) {
+                        user = "PROCESS_EXITED";
+                    } else {
+                        try {
+                            using (var searcher = new System.Management.ManagementObjectSearcher(
+                                $"Select * From Win32_Process Where ProcessID = {pid}")) {
+                                foreach (System.Management.ManagementObject mo in searcher.Get()) {
+                                    string[] ownerInfo = new string[2];
+                                    mo.InvokeMethod("GetOwner", (object[])ownerInfo);
+                                    if (ownerInfo[0] != null) {
+                                        user = string.IsNullOrWhiteSpace(ownerInfo[1])
+                                            ? ownerInfo[0]
+                                            : $"{ownerInfo[1]}\\{ownerInfo[0]}";
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        catch (Exception ex) {
+                            user = "NT AUTHORITY\\SYSTEM";
+                            string m = ex.Message ?? "";
+                            if (m.IndexOf("Not found", StringComparison.OrdinalIgnoreCase) < 0) {
+                                EnqueueDiag($"[USER RESOLVER] WMI lookup failed for PID {pid}: {ex.Message}");
+                            }
+                        }
                     }
 
                     ProcessUserCache.TryAdd(pid, user);
@@ -2343,7 +2422,7 @@ public class DeepVisibilitySensor {
         if (_mlEnginePtr == IntPtr.Zero) return;
 
         string eventUser = GetEventUser(pid);
-        string jsonEvent = BuildEnrichedJson("RawEvent", type, process, parent, pid, 0, tid, cmd, "", path, type, "");
+        string jsonEvent = BuildLightJson("RawEvent", type, process, parent, pid, 0, tid, cmd, path);
         if (jsonEvent == null) return;
 
         try {
@@ -2354,5 +2433,111 @@ public class DeepVisibilitySensor {
                     _mlWorkQueue.TryAdd(jsonEvent, 10);
             }
         } catch (InvalidOperationException) { }
+    }
+
+    private static void EmergencyTeardownLog(string message) {
+        try {
+            string logPath = @"C:\ProgramData\DeepSensor\Logs\DeepSensor_Diagnostic.log";
+            string ts = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff");
+            string formatted = $"[{ts}] [TEARDOWN_SYNC] {message}\r\n";
+            System.IO.File.AppendAllText(logPath, formatted);
+        } catch (Exception ex) {
+            System.Diagnostics.Debug.WriteLine($"[FATAL LOG ERROR] Failed to write '{message}' to disk: {ex.Message}");
+        }
+    }
+
+    public static void TeardownEngine() {
+        EmergencyTeardownLog("Initiating Engine Teardown sequence...");
+        _mlWorkQueue.CompleteAdding();
+        try { _yaraScanQueue.CompleteAdding(); } catch (Exception ex) { EmergencyTeardownLog($"yaraScanQueue.CompleteAdding error: {ex.Message}"); }
+        try { _yaraCts.Cancel(); } catch (Exception ex) { EmergencyTeardownLog($"yaraCts.Cancel error: {ex.Message}"); }
+        _mlCancelSource.Cancel();
+
+        if (_mlConsumerTask != null) {
+            EmergencyTeardownLog("Waiting for ML consumer thread to drain (8s timeout)...");
+            bool drained = _mlConsumerTask.Wait(8000);
+            if (!drained) {
+                EmergencyTeardownLog("WARN: ML consumer did not drain within 8s. Forcing teardown anyway. (Possible pipe/queue deadlock)");
+            } else {
+                EmergencyTeardownLog("ML consumer drained cleanly.");
+            }
+        }
+
+        if (_mlEnginePtr != IntPtr.Zero) {
+            IntPtr engineToFree = _mlEnginePtr;
+            _mlEnginePtr = IntPtr.Zero;
+            EmergencyTeardownLog("Invoking native FFI teardown_engine()...");
+            try {
+                teardown_engine(engineToFree);
+                EmergencyTeardownLog("Native Rust DLL safely unloaded and DB flushed.");
+            } catch (Exception ex) {
+                EmergencyTeardownLog($"FATAL: Native teardown_engine threw an exception: {ex.Message}");
+            }
+        }
+
+        EmergencyTeardownLog("Disposing YARA matrices...");
+        foreach (var rules in YaraMatrices.Values) {
+            try { rules.Dispose(); } catch (Exception ex) { EmergencyTeardownLog($"Yara matrix dispose error: {ex.Message}"); }
+        }
+        YaraMatrices.Clear();
+        if (_yaraContext != null) {
+            try { _yaraContext.Dispose(); } catch (Exception ex) { EmergencyTeardownLog($"YaraContext dispose error: {ex.Message}"); }
+            _yaraContext = null;
+        }
+        EmergencyTeardownLog("Engine Teardown sequence complete.");
+    }
+
+    public static void StopSession() {
+        EmergencyTeardownLog("Initiating ETW TraceEventSession teardown...");
+        if (_session != null) {
+            var primaryTeardown = new Thread(() => {
+                try {
+                    _session.Stop();
+                    _session.Dispose();
+                } catch (Exception ex) {
+                    EmergencyTeardownLog($"Failed to stop/dispose primary session: {ex.Message}");
+                }
+            });
+            primaryTeardown.Start();
+            primaryTeardown.Join(1000);
+            _session = null;
+        }
+
+        var cleanupThread = new Thread(() => {
+            try {
+                var activeSessions = TraceEventSession.GetActiveSessionNames();
+                var sessionsToTerminate = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                string kernelSession = KernelTraceEventParser.KernelSessionName;
+                if (activeSessions.Contains(kernelSession)) sessionsToTerminate.Add(kernelSession);
+
+                foreach (string sessionName in activeSessions) {
+                    if (sessionName.StartsWith("DeepSensor", StringComparison.OrdinalIgnoreCase)) {
+                        sessionsToTerminate.Add(sessionName);
+                    }
+                }
+
+                foreach (string targetSession in sessionsToTerminate) {
+                    EmergencyTeardownLog($"Attempting to terminate orphaned session: {targetSession}");
+                    try {
+                        using (var orphaned = new TraceEventSession(targetSession)) {
+                            orphaned.Stop(true);
+                        }
+                    } catch (Exception ex) {
+                        EmergencyTeardownLog($"Failed to stop orphaned session '{targetSession}': {ex.Message}");
+                    }
+                }
+            } catch (Exception ex) {
+                EmergencyTeardownLog($"Session teardown loop failed: {ex.Message}");
+            }
+        });
+        cleanupThread.Start();
+        cleanupThread.Join(2000);
+
+        if (_umThread != null && _umThread.IsAlive) {
+            EmergencyTeardownLog("Waiting for UserMode ETW thread to exit...");
+            _umThread.Join(500);
+        }
+        EmergencyTeardownLog("ETW TraceEventSession teardown complete.");
     }
 }

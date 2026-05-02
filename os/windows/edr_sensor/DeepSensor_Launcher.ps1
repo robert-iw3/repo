@@ -1192,6 +1192,15 @@ function Submit-SensorAlert {
 # 6. ENVIRONMENT & BOOTSTRAP FUNCTIONS
 # ======================================================================
 
+function Unlock-PolicySyncPaths {
+    $PathsToUnlock = @($ScriptDir, $global:SecureStaging)
+    foreach ($p in $PathsToUnlock) {
+        if (Test-Path $p) {
+            $null = icacls $p /reset /T /C /Q *>$null
+        }
+    }
+}
+
 function Protect-SensorEnvironment {
     Write-Diag "[*] Hardening Sensor Ecosystem (DACLs & Registry)..." "STARTUP"
 
@@ -2233,6 +2242,12 @@ try {
         foreach ($p in (($pe["TrustedNoise"] -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
             [void][DeepVisibilitySensor]::ProcessTrustClass.TryAdd($p, 2)
         }
+        foreach ($p in (($pe["CriticalSystemProcesses"] -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            [void][DeepVisibilitySensor]::CriticalSystemProcesses.TryAdd($p, [byte]0)
+        }
+        foreach ($p in (($pe["JitRuntimeProcesses"] -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            [void][DeepVisibilitySensor]::JitRuntimeProcesses.TryAdd($p, [byte]0)
+        }
     }
 
     Write-Diag ("    [+] Armed-mode tiering: T1={0} T2={1} T3={2}, {3} trust class(es), {4} lineage(s), {5} severity weight(s)." -f `
@@ -2242,6 +2257,9 @@ try {
         ([DeepVisibilitySensor]::ProcessTrustClass.Count), `
         ([DeepVisibilitySensor]::BenignLineages.Count), `
         ([DeepVisibilitySensor]::SeverityWeights.Count)) "STARTUP"
+    Write-Diag ("    [+] Anti-BSOD lists: {0} critical system process(es), {1} JIT runtime(s)." -f `
+        ([DeepVisibilitySensor]::CriticalSystemProcesses.Count), `
+        ([DeepVisibilitySensor]::JitRuntimeProcesses.Count)) "STARTUP"
 
     # Map the DLL path for the C# DllImport dynamically
     $SecureBinDir = Split-Path $ValidMlBinaryPath -Parent
@@ -2544,20 +2562,36 @@ try {
 
         if (($now - $LastPolicySync).TotalMinutes -ge 60) {
             $LastPolicySync = $now
-            icacls $ScriptDir /reset /T /C /Q *>$null
-            $EngineData = Initialize-SigmaEngine
+            $syncStatus = "POLICY SYNC COMPLETE"
+            $syncColor  = $cGreen
 
-            if (-not [string]::IsNullOrEmpty($EngineData.Base64Sigma)) {
-                [DeepVisibilitySensor]::UpdateSigmaRules($EngineData.Base64Sigma)
-            } else {
-                Write-Diag "    [!] Warning: No valid Sigma rules parsed on startup." "STARTUP"
-                $EmptyJson = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("[]"))
-                [DeepVisibilitySensor]::Initialize($EmptyJson)
+            try {
+                Unlock-PolicySyncPaths
+
+                $EngineData = Initialize-SigmaEngine
+
+                if (-not [string]::IsNullOrEmpty($EngineData.Base64Sigma)) {
+                    [DeepVisibilitySensor]::UpdateSigmaRules($EngineData.Base64Sigma)
+                } else {
+                    Write-Diag "    [!] Policy sync produced empty Sigma corpus; retaining previously-loaded rule matrix." "STARTUP"
+                    $syncStatus = "POLICY SYNC: EMPTY CORPUS, RETAINED PRIOR RULES"
+                    $syncColor  = $cYellow
+                }
+
+                if ($null -ne $EngineData -and $null -ne $EngineData.Drivers) {
+                    [DeepVisibilitySensor]::UpdateThreatIntel($EngineData.Drivers)
+                }
+            }
+            catch {
+                Write-Diag "    [-] Policy sync error: $($_.Exception.Message). Prior rules retained." "STARTUP"
+                $syncStatus = "POLICY SYNC FAILED -- PRIOR RULES RETAINED"
+                $syncColor  = $cRed
+            }
+            finally {
+                Protect-SensorEnvironment
             }
 
-            [DeepVisibilitySensor]::UpdateThreatIntel($EngineData.Drivers)
-            Protect-SensorEnvironment
-            Add-AlertMessage "POLICY SYNC COMPLETE" $cGreen
+            Add-AlertMessage $syncStatus $syncColor
         }
 
         $maxDequeue = 500
@@ -2845,12 +2879,14 @@ try {
             $lastLightGC = $now
         }
 
-        # ETW HEALTH CANARY & WATCHDOG EVALUATION
+        # ETW HEALTH CANARY & WATCHDOG EVALUATION + METRICS EMIT
         if (($now - $LastHeartbeatWrite).TotalSeconds -ge 60) {
             $LastHeartbeatWrite = $now
             $CanaryPath = Join-Path "C:\ProgramData\DeepSensor\Data" "deepsensor_canary.tmp"
             $null = New-Item -ItemType File -Path $CanaryPath -Force
             Remove-Item -Path $CanaryPath -Force -ErrorAction SilentlyContinue
+
+            try { [DeepVisibilitySensor]::EmitMetricsLine() } catch {}
         }
 
         $tamperStatus = "Good"
@@ -2882,19 +2918,33 @@ try {
         }
 
         if ($tamperStatus -eq "BAD") {
-            Write-Diag "SENSOR BLINDED: ETW thread unresponsive. Initiating auto-recovery." "ERROR"
+            $script:RecoveryAttempts = if ($null -ne $script:RecoveryAttempts) { $script:RecoveryAttempts + 1 } else { 1 }
+            $script:RecoveryMaxAttempts = 3
+
+            if ($script:RecoveryAttempts -gt $script:RecoveryMaxAttempts) {
+                Write-Diag "AUTO-RECOVERY ABANDONED after $script:RecoveryMaxAttempts consecutive failures. Underlying cause likely permanent (kernel ETW disabled, GPO change, driver conflict). Exiting orchestrator -- restart sensor manually after addressing host state." "CRITICAL"
+                $global:FatalCrashMsg = "Auto-recovery exhausted ($script:RecoveryMaxAttempts attempts)."
+                break
+            }
+
+            Write-Diag "SENSOR BLINDED: ETW thread unresponsive. Auto-recovery attempt $script:RecoveryAttempts of $script:RecoveryMaxAttempts." "ERROR"
             Write-Diag "Auto-Recovery: Tearing down dead ETW session..." "INFO"
             try { [DeepVisibilitySensor]::StopSession() } catch {}
 
             Start-Sleep -Seconds 2
 
             Write-Diag "Auto-Recovery: Re-building memory pointers & initializing native ETW session..." "INFO"
+            $recoveryOk = $false
             try {
                 [DeepVisibilitySensor]::StartSession()
-
                 Start-Sleep -Seconds 1
+                $recoveryOk = $true
             } catch {
                 Write-Diag "Auto-Recovery FAILED: $($_.Exception.Message)" "CRITICAL"
+            }
+
+            if ($recoveryOk) {
+                $script:RecoveryAttempts = 0
             }
 
             $LastHeartbeat = Get-Date
