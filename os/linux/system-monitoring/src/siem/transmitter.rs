@@ -74,7 +74,9 @@ impl TransmissionLayer {
             while let Some(alert) = rx.recv().await {
                 let output_path = PathBuf::from(BPF_OUTPUT_DIR).join(format!("{}.json", alert.event_id));
                 if let Ok(json) = serde_json::to_string(&alert) {
-                    let _ = tokio::fs::write(output_path, json).await;
+                    if let Err(e) = tokio::fs::write(&output_path, json).await {
+                        error!("Failed to write JSON artifact to {}: {}", output_path.display(), e);
+                    }
                 }
 
                 let res = sqlx::query(

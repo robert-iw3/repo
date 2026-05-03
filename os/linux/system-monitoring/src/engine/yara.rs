@@ -70,7 +70,10 @@ impl YaraEngine {
                                 MitreTactic::Execution,
                                 "T1204 User Execution",
                             );
-                            let _ = tx.try_send(alert);
+
+                            if let Err(e) = tx.try_send(alert) {
+                                error!("Pipeline Failure: Failed to route YARA alert for {}: {}", path.display(), e);
+                            }
                         }
                     }
                 }).await?;

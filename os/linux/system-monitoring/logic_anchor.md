@@ -446,38 +446,14 @@ The 3-second drain window must exceed worst-case SQLite write latency under load
 ### 8.1 Compile Blockers (Code will not build)
 | # | File | Issue | Root Cause |
 |---|------|-------|------------|
-| 1 | `main.rs` | `tx` referenced but undefined — used in YARA spawn, Honeypot spawn, and `drop(tx)` in shutdown | Should be `alert_tx` |
-| 2 | `main.rs` | `config.engine.enable_api_server` — field does not exist on `EngineConfig` | Field never added to config.rs |
-| 3 | `main.rs` | `config.engine.enable_anti_evasion` — field does not exist on `EngineConfig` | Field never added to config.rs |
-| 4 | `main.rs` | `transmitter.get_pool()` — no such method on `TransmissionLayer` | `db_pool` is a private field with no accessor |
-| 5 | `main.rs` | `pub mod db` declared in siem module — no `db.rs` file exists | Dead module declaration |
-| 6 | `honeypot.rs` | `SecurityAlert::new(...)` — only `from_rule()` exists on `SecurityAlert` | Missing constructor or wrong call |
-| 7 | `config.rs` | `MasterConfig` missing `[monitoring]`, `[network]`, `[process]`, `[files]` structs | `toml::from_str` fails on unknown sections |
-| 8 | `config.rs` | `EngineConfig` missing `enable_anti_evasion` field | TOML has it, Rust struct doesn't |
-| 9 | `transmitter.rs` | `AlertLevel`/`MitreTactic` lack `Display` impl — `.to_string()` in `.bind()` calls | Need `impl Display` or use serde serialization |
 
 ### 8.2 Build & Deploy Issues (Build or deploy will fail)
 | # | File | Issue | Impact |
 |---|------|-------|--------|
-| 10 | `Dockerfile` | `USER nobody` before `RUN setcap` — setcap requires root | Docker build fails at setcap |
-| 11 | `Dockerfile` | Builder stage missing `libbpf-dev`, `clang`, `linux-headers-generic` | eBPF skeleton compilation fails |
-| 12 | `Dockerfile` | Rust 1.73 potentially too old for current crate versions | Build may fail on newer crate MSRV |
-| 13 | `deployment.yml` | Uses `Deployment` not `DaemonSet` | Wrong K8s topology for per-node EDR |
-| 14 | `deployment.yml` | `privileged: true` + `allowPrivilegeEscalation: false` contradicts | K8s may reject or behave unexpectedly |
-| 15 | `deployment.yml` | `readOnlyRootFilesystem: true` conflicts with write targets | Runtime write failures unless all paths are emptyDir-mounted |
-| 16 | `service` | Missing `[Unit]` section — no Description, no After ordering | systemd warning, no dependency ordering |
-| 17 | `timer` | Hourly timer for a long-running daemon | Wrong service management paradigm |
 
 ### 8.3 Runtime Correctness (Will compile but behave incorrectly)
 | # | File | Issue | Impact |
 |---|------|-------|--------|
-| 18 | `yara.rs` | `scanner.scan_file()` is blocking CPU work inside async task | Tokio worker thread starvation under load |
-| 19 | `scanner.rs` | `Command::new("ps")` is blocking inside async task | Tokio worker thread starvation |
-| 20 | `transmitter.rs` | `std::fs::write()` for JSON artifacts is blocking inside async task | Tokio worker thread starvation under burst |
-| 21 | `server.rs` | `sqlx::query!` macro needs `DATABASE_URL` at compile time | Must use runtime `sqlx::query()` or set up offline mode |
-| 22 | `server.rs` | SELECT references column `id` but table uses `event_id` | Runtime query failure |
-| 23 | `server.rs` | Bearer token comparison uses `==` (not constant-time) | Timing side-channel (low risk for local agent) |
-| 24 | `scanner.rs` | `enable_anti_evasion` disabled but `raw_rx` still exists — events fill channel forever | Memory growth, eventual OOM if eBPF is enabled but scanner is not |
 
 ---
 

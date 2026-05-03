@@ -16,9 +16,9 @@ pub fn init_central_logging(log_dir: &str) -> WorkerGuard {
         .json(); // Structured JSON logging for SIEM ingestion
 
     tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
         .with(format_layer)
-        .with(fmt::layer().with_writer(std::io::stdout)) // Mirror to stdout for container logs
+        .with(fmt::layer().with_writer(std::io::stdout))
         .init();
 
     guard // Must be kept alive in main.rs

@@ -57,7 +57,9 @@ impl HoneypotEngine {
                                     "T1046 Network Service Scanning",
                                 );
 
-                                let _ = tx_clone.try_send(alert);
+                                if let Err(e) = tx_clone.try_send(alert) {
+                                    error!("Pipeline Failure: Failed to route honeypot alert for port {}: {}", port, e);
+                                }
                             }
                         }
                     }

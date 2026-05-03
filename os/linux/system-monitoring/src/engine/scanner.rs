@@ -159,7 +159,9 @@ impl ScannerEngine {
                 entropy, velocity, 0.0, path_depth, 0.0
             );
 
-            let _ = self.alert_tx.try_send(burst_alert);
+            if let Err(e) = self.alert_tx.try_send(burst_alert) {
+                error!("Pipeline Failure: Failed to route UEBA burst alert: {}", e);
+            }
 
             debug!("Resetting UEBA burst window for {}", process_hash);
             profile.recent_timestamps.clear();
@@ -187,7 +189,8 @@ impl ScannerEngine {
                 let parts: Vec<&str> = line.split(':').collect();
                 if parts.len() > 2 && parts[0] != "root" && parts[2].parse::<u32>().unwrap_or(9999) == 0 {
                     warn!("Rogue root UID detected: {}", parts[0]);
-                    let _ = self.alert_tx.try_send(SecurityAlert::from_rule(
+
+                    let alert = SecurityAlert::from_rule(
                         RuleMatch {
                             level: AlertLevel::Critical,
                             mitre_tactic: MitreTactic::PrivilegeEscalation,
@@ -195,7 +198,11 @@ impl ScannerEngine {
                             message: format!("Rogue root UID user detected: {}", parts[0]),
                         },
                         0, 0, 0, "SYSTEM".to_string(), "".to_string(), None, None, None, 0.0, 0.0, 0.0, 0, 0.0
-                    ));
+                    );
+
+                    if let Err(e) = self.alert_tx.try_send(alert) {
+                        error!("Pipeline Failure: Failed to route rogue user alert: {}", e);
+                    }
                 }
             }
         }
@@ -269,7 +276,8 @@ impl ScannerEngine {
         if let Ok(contents) = tokio::fs::read_to_string("/etc/ld.so.preload").await {
             if !contents.trim().is_empty() {
                 warn!("LD_PRELOAD tampering detected.");
-                let _ = self.alert_tx.try_send(SecurityAlert::from_rule(
+
+                let alert = SecurityAlert::from_rule(
                     RuleMatch {
                         level: AlertLevel::High,
                         mitre_tactic: MitreTactic::Persistence,
@@ -277,7 +285,11 @@ impl ScannerEngine {
                         message: format!("Suspicious LD_PRELOAD injection: {}", contents.trim()),
                     },
                     0, 0, 0, "SYSTEM".to_string(), "".to_string(), None, None, None, 0.0, 0.0, 0.0, 0, 0.0
-                ));
+                );
+
+                if let Err(e) = self.alert_tx.try_send(alert) {
+                    error!("Pipeline Failure: Failed to route LD_PRELOAD alert: {}", e);
+                }
             }
         }
     }
