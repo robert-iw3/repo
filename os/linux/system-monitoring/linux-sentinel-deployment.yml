@@ -32,7 +32,6 @@ spec:
             - BPF
             - PERFMON
           readOnlyRootFilesystem: true
-          allowPrivilegeEscalation: false
         ports:
         - containerPort: 8080
           name: api

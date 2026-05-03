@@ -51,7 +51,31 @@ pub struct SecurityAlert {
     pub message: String,
 }
 
+impl std::fmt::Display for AlertLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::fmt::Display for MitreTactic {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            MitreTactic::Execution => "TA0002 Execution",
+            MitreTactic::Persistence => "TA0003 Persistence",
+            MitreTactic::PrivilegeEscalation => "TA0004 Privilege Escalation",
+            MitreTactic::DefenseEvasion => "TA0005 Defense Evasion",
+            MitreTactic::CommandAndControl => "TA0011 Command and Control",
+            MitreTactic::Exfiltration => "TA0010 Exfiltration",
+            MitreTactic::Unknown => "Unknown",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 impl SecurityAlert {
+    /// constructor 1: HIGH-FIDELITY (from_rule)
+    /// Used by the ScannerEngine to achieve single-pass, zero-copy memory allocation
+    /// for kernel telemetry enriched with mathematical UEBA features.
     pub fn from_rule(
         rule: RuleMatch,
         pid: u32, ppid: u32, uid: u32, comm: String, command_line: String,
@@ -68,6 +92,31 @@ impl SecurityAlert {
             pid, ppid, uid, comm, command_line,
             target_file, dest_ip, dest_port,
             shannon_entropy, execution_velocity, tuple_rarity, path_depth, anomaly_score,
+        }
+    }
+
+    /// constructor 2: SYNTHETIC
+    /// A convenience constructor for modules like Honeypots or YARA that do not
+    /// originate from raw kernel syscalls and lack 5D mathematical context.
+    pub fn new(
+        level: AlertLevel,
+        message: String,
+        mitre_tactic: MitreTactic,
+        mitre_technique: &str
+    ) -> Self {
+        Self {
+            event_id: Uuid::new_v4().to_string(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            level,
+            mitre_tactic,
+            mitre_technique: mitre_technique.to_string(),
+            pid: 0, ppid: 0, uid: 0,
+            comm: String::new(),
+            command_line: String::new(),
+            target_file: None, dest_ip: None, dest_port: None,
+            shannon_entropy: 0.0, execution_velocity: 0.0, tuple_rarity: 0.0,
+            path_depth: 0, anomaly_score: 0.0,
+            message,
         }
     }
 }

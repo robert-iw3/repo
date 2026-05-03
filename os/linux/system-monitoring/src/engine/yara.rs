@@ -55,32 +55,25 @@ impl YaraEngine {
 
             for path_str in &self.config.files.critical_paths {
                 let path = PathBuf::from(path_str);
-                if !path.exists() || !path.is_file() {
-                    continue;
-                }
+                if !path.exists() || !path.is_file() { continue; }
 
-                match scanner.scan_file(&path) {
-                    Ok(results) => {
+                let rules = self.rules.clone();
+                let tx = self.tx.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    let mut scanner = rules.scanner().unwrap();
+                    if let Ok(results) = scanner.scan_file(&path) {
                         for result in results {
-                            let msg = format!(
-                                "YARA rule '{}' matched on file: {}",
-                                result.identifier,
-                                path.display()
-                            );
-                            warn!("{}", msg);
-
                             let alert = SecurityAlert::new(
                                 AlertLevel::Critical,
-                                msg,
-                                MitreTactic::Execution, // Maps to malicious execution/persistence
+                                format!("YARA Match: {} on {}", result.identifier, path.display()),
+                                MitreTactic::Execution,
                                 "T1204 User Execution",
                             );
-
-                            let _ = self.tx.try_send(alert);
+                            let _ = tx.try_send(alert);
                         }
                     }
-                    Err(e) => error!("Failed to scan file {}: {}", path.display(), e),
-                }
+                }).await?;
             }
         }
     }

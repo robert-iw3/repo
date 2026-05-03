@@ -25,7 +25,6 @@ mod engine {
     pub mod yara;
 }
 mod siem {
-    pub mod db;
     pub mod models;
     pub mod transmitter;
 }
@@ -47,7 +46,7 @@ fn bump_memlock_rlimit() -> Result<()> {
 async fn main() -> Result<()> {
     // Non-Blocking Diagnostics & Master Config
     let _log_guard = init_central_logging("/var/log/linux-sentinel/diagnostics");
-    info!("Initializing Linux Sentinel v2.6.0 Enterprise EDR...");
+    info!("Initializing Linux Sentinel...");
 
     bump_memlock_rlimit()?;
 
@@ -88,11 +87,17 @@ async fn main() -> Result<()> {
             let engine = ScannerEngine::new(config_scan, raw_rx, alert_tx_scan);
             engine.run().await;
         }));
+    } else if config.engine.enable_ebpf {
+        // DRAIN TASK: Prevents channel backpressure OOM if eBPF is on but UEBA is off
+        let mut rx = raw_rx;
+        async_tasks.push(tokio::spawn(async move {
+            while rx.recv().await.is_some() {}
+        }));
     }
 
     // 6. YARA File Integrity Engine
     if config.engine.enable_yara {
-        let tx_yara = tx.clone();
+        let tx_yara = alert_tx.clone();
         let config_yara = config.clone();
         async_tasks.push(tokio::spawn(async move {
             match YaraEngine::new(config_yara, "/opt/linux-sentinel/rules.yara", tx_yara) {
@@ -104,7 +109,7 @@ async fn main() -> Result<()> {
 
     // 7. Active Defense Deception Nodes
     if config.engine.enable_honeypots {
-        let tx_honey = tx.clone();
+        let tx_honey = alert_tx.clone();
         let config_honey = config.clone();
         async_tasks.push(tokio::spawn(async move {
             let engine = HoneypotEngine::new(config_honey, tx_honey);
@@ -146,7 +151,7 @@ async fn main() -> Result<()> {
             info!("SIGTERM received. Initiating graceful teardown...");
 
             // Drop the transmission channel, forcing the SQLite worker to drain the queue
-            drop(tx);
+            drop(alert_tx);
 
             // Guarantee 3 seconds for the SQLite Write-Ahead Log (WAL) to checkpoint to disk
             info!("Flushing in-memory telemetry to SQLite (Waiting 3 seconds)...");

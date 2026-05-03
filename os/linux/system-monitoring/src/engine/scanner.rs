@@ -3,7 +3,6 @@ use crate::engine::rules::{RawKernelEvent, RulesEngine};
 use crate::siem::models::{AlertLevel, MitreTactic, RuleMatch, SecurityAlert};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
-use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -183,7 +182,7 @@ impl ScannerEngine {
 
     async fn monitor_users(&self) {
         trace!("Running user integrity check (/etc/passwd)");
-        if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        if let Ok(passwd) = tokio::fs::read_to_string("/etc/passwd").await {
             for line in passwd.lines() {
                 let parts: Vec<&str> = line.split(':').collect();
                 if parts.len() > 2 && parts[0] != "root" && parts[2].parse::<u32>().unwrap_or(9999) == 0 {
@@ -204,7 +203,7 @@ impl ScannerEngine {
 
     async fn monitor_memory(&self) {
         trace!("Running system memory threshold check");
-        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        if let Ok(meminfo) = tokio::fs::read_to_string("/proc/meminfo").await {
             if let Some(total) = meminfo.lines().find(|l| l.starts_with("MemTotal"))
                 .and_then(|l| l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok())) {
                 if total < 1_000_000 {
@@ -216,29 +215,58 @@ impl ScannerEngine {
 
     async fn check_hidden_processes(&self) {
         trace!("Running kernel vs user-space PID integrity check");
-        let proc_count = fs::read_dir("/proc").unwrap_or_else(|_| fs::read_dir(".").unwrap())
-            .filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().parse::<u32>().is_ok()).count();
 
-        if let Ok(output) = Command::new("ps").arg("-e").arg("--no-headers").output() {
-            let ps_count = String::from_utf8_lossy(&output.stdout).lines().count();
-            if proc_count > ps_count + 10 {
-                warn!("Rootkit Anomaly: Kernel (/proc) reports {} PIDs, User-space (ps) reports {}", proc_count, ps_count);
-                let _ = self.alert_tx.try_send(SecurityAlert::from_rule(
-                    RuleMatch {
-                        level: AlertLevel::Critical,
-                        mitre_tactic: MitreTactic::DefenseEvasion,
-                        mitre_technique: "T1014 Rootkit".to_string(),
-                        message: format!("Kernel/User-space PID mismatch. /proc: {}, ps: {}", proc_count, ps_count),
-                    },
-                    0, 0, 0, "SYSTEM".to_string(), "".to_string(), None, None, None, 0.0, 0.0, 0.0, 0, 0.0
-                ));
+        // 1. NON-BLOCKING: Async directory iteration
+        let mut proc_dir = match tokio::fs::read_dir("/proc").await {
+            Ok(dir) => dir,
+            Err(e) => {
+                error!("Rootkit Check: Failed to read /proc: {}", e);
+                return;
+            }
+        };
+
+        let mut proc_count = 0;
+        while let Ok(Some(entry)) = proc_dir.next_entry().await {
+            if entry.file_name().to_string_lossy().parse::<u32>().is_ok() {
+                proc_count += 1;
+            }
+        }
+
+        // 2. NON-BLOCKING: Async process execution
+        let output = match tokio::process::Command::new("ps")
+            .args(["-e", "--no-headers"])
+            .output()
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                error!("Rootkit Check: Failed to execute 'ps': {}", e);
+                return;
+            }
+        };
+
+        let ps_count = String::from_utf8_lossy(&output.stdout).lines().count();
+
+        // 3. SYNTHETIC ALERT: Uses the convenience constructor
+        if proc_count > ps_count + 10 {
+            warn!("Rootkit Anomaly: Kernel (/proc) reports {} PIDs, User-space (ps) reports {}", proc_count, ps_count);
+
+            let alert = SecurityAlert::new(
+                AlertLevel::Critical,
+                format!("Kernel/User-space PID mismatch. /proc: {}, ps: {}", proc_count, ps_count),
+                MitreTactic::DefenseEvasion,
+                "T1014 Rootkit",
+            );
+
+            if let Err(e) = self.alert_tx.try_send(alert) {
+                error!("Pipeline Failure: Failed to route rootkit alert: {}", e);
             }
         }
     }
 
     async fn check_ld_preload(&self) {
         trace!("Checking /etc/ld.so.preload for dynamic linker hijacking");
-        if let Ok(contents) = fs::read_to_string("/etc/ld.so.preload") {
+        if let Ok(contents) = tokio::fs::read_to_string("/etc/ld.so.preload").await {
             if !contents.trim().is_empty() {
                 warn!("LD_PRELOAD tampering detected.");
                 let _ = self.alert_tx.try_send(SecurityAlert::from_rule(

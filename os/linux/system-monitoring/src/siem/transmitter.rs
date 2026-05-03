@@ -65,22 +65,40 @@ impl TransmissionLayer {
         Ok(Self { db_pool, client: Client::new(), gateway_url: gateway_url.to_string() })
     }
 
+    pub fn get_pool(&self) -> Pool<Sqlite> {
+        self.db_pool.clone()
+    }
+
     pub fn spawn_worker(self: Arc<Self>, mut rx: mpsc::Receiver<SecurityAlert>) {
         tokio::spawn(async move {
             while let Some(alert) = rx.recv().await {
-                // 1. Maintain local JSON parity for the threat intel engine
                 let output_path = PathBuf::from(BPF_OUTPUT_DIR).join(format!("{}.json", alert.event_id));
                 if let Ok(json) = serde_json::to_string(&alert) {
-                    let _ = std::fs::write(output_path, json);
+                    let _ = tokio::fs::write(output_path, json).await;
                 }
 
-                // 2. High-fidelity SQLite ingestion
                 let res = sqlx::query(
                     r#"
                     INSERT INTO events (
-                        event_id, timestamp, level, mitre_tactic, mitre_technique,
-                        pid, ppid, uid, comm, command_line, target_file, dest_ip, dest_port,
-                        shannon_entropy, execution_velocity, tuple_rarity, path_depth, anomaly_score, message
+                        event_id,
+                        timestamp,
+                        level,
+                        mitre_tactic,
+                        mitre_technique,
+                        pid,
+                        ppid,
+                        uid,
+                        comm,
+                        command_line,
+                        target_file,
+                        dest_ip,
+                        dest_port,
+                        shannon_entropy,
+                        execution_velocity,
+                        tuple_rarity,
+                        path_depth,
+                        anomaly_score,
+                        message
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#
                 )

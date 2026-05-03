@@ -1,13 +1,44 @@
-# Linux Sentinel v0.2.0 (Extreme Alpha)
+# Linux Sentinel v0.2.0 (Alpha)
 
-> **⚠️ WARNING:** This project is currently in the **Extreme Alpha** testing stage. It is undergoing high-frequency architectural changes. Do not deploy in mission-critical production environments without thorough verification.
+> **⚠️ WARNING:** This project is currently in the **Alpha** testing stage. It is undergoing high-frequency architectural changes. Do not deploy in mission-critical production environments without thorough verification.
 
 ## Project Mission Statement
 To deliver a production-grade, zero-fault Extended Detection and Response (EDR) agent that achieves absolute observability over the Linux kernel. Acting as the definitive counterpart to the **Windows DeepSensor** architecture, Linux Sentinel leverages unmanaged eBPF telemetry to capture deep execution lineage, fileless malware, and kernel-level rootkits without taxing the CPU.
 
 By routing raw kernel events through a native Rust-based Machine Learning and UEBA pipeline, Sentinel transforms high-frequency system noise into high-fidelity, **5D mathematical threat models**. It unifies active deception (Honeypots), static integrity (YARA), and dynamic behavioral profiling into a single, self-healing binary.
 
-
+### Directory Layout
+```sh
+linux-sentinel/
+├── src/
+│   ├── main.rs                 # supervisor orchestrator & entry point
+│   ├── config.rs               # master.toml parsing logic
+│   ├── api/
+│   │   └── server.rs           # authenticated axum API & dashboard
+│   ├── bpf/
+│   │   └── sentinel.bpf.c      # eBPF kernel probes (C code)
+│   ├── engine/
+│   │   ├── ebpf.rs             # kernel-to-user space telemetry router
+│   │   ├── rules.rs            # MITRE ATT&CK & threat intel evaluator
+│   │   ├── scanner.rs          # 5D UEBA mathematical router (the "brain")
+│   │   ├── honeypot.rs         # active deception nodes
+│   │   └── yara.rs             # static file integrity scanner
+│   ├── siem/
+│   │   ├── models.rs           # SIEM event schemas & RuleMatch structs
+│   │   └── transmitter.rs      # SQLite WAL storage & SIEM forwarder
+│   └── utils/
+│       └── logging.rs          # holistic diagnostic tracing setup
+├── Cargo.toml                  # rust dependencies & build metadata
+├── build.rs                    # libbpf CO-RE compilation hook
+├── Dockerfile                  # multi-stage production container build
+├── run.sh                      # podman/docker deployment supervisor
+├── master.toml                 # main engine configuration (auth tokens/toggles)
+├── rules.yara                  # compiled static threat signatures
+├── linux-sentinel.service      # systemd service unit
+├── linux-sentinel.timer        # systemd hourly run timer
+├── linux-sentinel-deployment.yml # kubernetes daemonset manifest
+└── README.md                   # project documentation & mission statement
+```
 
 ## Core Features
 * **Kernel-Level Observability:** Native eBPF hooks for `execve`, `openat`, `ptrace`, `memfd_create`, and `udp_sendmsg`.

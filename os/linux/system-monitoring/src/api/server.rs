@@ -62,7 +62,20 @@ impl ApiServer {
     }
 }
 
-// Security: Zero-Trust Bearer Token Validation
+/// Constant-time comparison to prevent timing attacks on API authentication.
+/// This ensures the comparison time is independent of how many leading bytes match.
+fn secure_compare(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut res = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        res |= x ^ y;
+    }
+    res == 0
+}
+
+// The Auth Middleware using this secure comparison
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
@@ -72,7 +85,9 @@ async fn auth_middleware(
     let expected_token = format!("Bearer {}", state.config.siem.auth_token);
 
     if let Some(header_value) = auth_header {
-        if header_value.to_str().unwrap_or_default() == expected_token {
+        let provided_token = header_value.as_bytes();
+        // Use secure_compare to validate the Bearer token
+        if secure_compare(provided_token, expected_token.as_bytes()) {
             return Ok(next.run(req).await);
         }
     }
@@ -98,7 +113,9 @@ async fn status_handler(axum::extract::State(state): axum::extract::State<Arc<Ap
 
 // GET /api/alerts - Pulls the latest eBPF telemetry directly from SQLite
 async fn alerts_handler(axum::extract::State(state): axum::extract::State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let result = sqlx::query!("SELECT id, timestamp, level, message, mitre_technique FROM events ORDER BY timestamp DESC LIMIT 100")
+    use sqlx::Row;
+
+    let result = sqlx::query("SELECT event_id as id, timestamp, level, message, mitre_technique FROM events ORDER BY timestamp DESC LIMIT 100")
         .fetch_all(&state.db_pool)
         .await;
 
@@ -106,11 +123,11 @@ async fn alerts_handler(axum::extract::State(state): axum::extract::State<Arc<Ap
         Ok(records) => {
             let alerts: Vec<_> = records.into_iter().map(|rec| {
                 serde_json::json!({
-                    "id": rec.id,
-                    "timestamp": rec.timestamp,
-                    "level": rec.level,
-                    "message": rec.message,
-                    "technique": rec.mitre_technique
+                    "id": rec.try_get::<String, _>("id").unwrap_or_default(),
+                    "timestamp": rec.try_get::<i64, _>("timestamp").unwrap_or_default(),
+                    "level": rec.try_get::<String, _>("level").unwrap_or_default(),
+                    "message": rec.try_get::<String, _>("message").unwrap_or_default(),
+                    "technique": rec.try_get::<String, _>("mitre_technique").unwrap_or_default()
                 })
             }).collect();
 

@@ -3,11 +3,20 @@ ARG repo="docker.io"
 
 FROM ${repo}/rust:1.73 as builder
 WORKDIR /usr/src/linux-sentinel
+RUN \
+    apt-get update;
+    apt-get install -y --no-install-recommends \
+        clang \
+        llvm \
+        libbpf-dev \
+        linux-headers-generic; \
+    rm -rf /var/lib/apt/lists/*
+
 COPY . .
 RUN cargo build --release
 
-FROM ${repo}/ubuntu:22.04
-LABEL maintainer="Linux Sentinel Team <riweber3@protonmail.com>"
+FROM ${repo}/ubuntu:24.04
+LABEL maintainer="@RW"
 LABEL version="0.2.0"
 LABEL description="Rust-based Linux Sentinel Security Monitoring Tool"
 
@@ -39,8 +48,8 @@ RUN \
     chmod -R 750 /var/log/linux-sentinel /var/backups/linux-sentinel; \
     chmod 755 /opt/linux-sentinel/linux-sentinel
 
-USER nobody
 RUN setcap cap_net_admin,cap_dac_read_search,cap_sys_ptrace+ep /opt/linux-sentinel/linux-sentinel
+USER nobody
 
 ENV DASHBOARD_PORT=8080
 
