@@ -3,10 +3,9 @@ Description=Linux Sentinel v2.3 Security Monitor
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/opt/linux-sentinel/linux-sentinel enhanced
-User=nobody
-Group=nogroup
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/linux-sentinel/linux_sentinel.py enhanced
+User=root
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
@@ -15,8 +14,6 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

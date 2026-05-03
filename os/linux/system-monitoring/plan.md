@@ -1,0 +1,12 @@
+### The North Star Vision: Linux Sentinel
+
+**Mission Statement:** To engineer the definitive, unified Extended Detection and Response (EDR) agent for Linux—achieving absolute, zero-fault observability over the kernel. Deployed seamlessly as a fully containerized architecture (Docker/Podman), Linux Sentinel transcends traditional monitoring by fusing unmanaged eBPF kernel telemetry with real-time threat intelligence to generate high-fidelity, MITRE-mapped alerts. It serves as the uncompromising Linux counterpart to Windows DeepSensor, built from the ground up to protect host stability while exposing advanced Living-off-the-Land (LotL) tradecraft, fileless malware, and rootkit manipulation.
+
+**Core Strategic Objectives and End-State Capabilities:**
+
+* **Zero-Fault Kernel Telemetry (The Foundation):** Leverage unmanaged eBPF to extract deep system events—capturing complete execution lineage, network tuple anomalies, and memory space manipulation—without introducing CPU latency, risking kernel panics, or dropping events under massive enterprise loads.
+* **Unified Threat Intelligence Engine:** Act as a dynamic evaluation bridge, instantly correlating raw kernel telemetry with live threat intelligence feeds (FireHOL, LOLDrivers, custom blocklists) to generate precise, real-time alerts without blocking the execution pipeline.
+* **Native AST Parsing (The Horizon):** Elevate the threat-hunting paradigm beyond hardcoded logic. As the architecture matures, the engine will integrate native Abstract Syntax Tree (AST) parsing to dynamically interpret, compile, and execute complex Sigma rules, YARA signatures, and custom Tactics, Techniques, and Procedures (TTPs) directly into the high-speed behavioral engine.
+* **Holistic, Self-Healing Orchestration:** Unify passive kernel observability, mathematical 5D UEBA profiling (Shannon Entropy, Execution Velocity), static file integrity, and active deception nodes into a single, cohesive Rust binary. Every engine operates in total isolation under a strict supervisor tree, guaranteeing that a failure in one module never compromises the defensive integrity of the host system.
+
+**The Current Mandate (v0.2.0 Extreme Alpha):** Before the advanced AST parsers and ML engines can be finalized, the physical foundation must be bulletproof. The current phase is strictly dedicated to ensuring the agent can successfully bind to the kernel, allocate massive memory maps (`RLIMIT_MEMLOCK`), survive container orchestration probes, and manage extreme SQLite backpressure without triggering a system fault.

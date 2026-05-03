@@ -1,55 +1,53 @@
 # syntax=docker/dockerfile:1
 ARG repo="docker.io"
 
+FROM ${repo}/rust:1.73 as builder
+WORKDIR /usr/src/linux-sentinel
+COPY . .
+RUN cargo build --release
+
 FROM ${repo}/ubuntu:22.04
-
 LABEL maintainer="Linux Sentinel Team <riweber3@protonmail.com>"
-LABEL version="2.3"
-LABEL description="Linux Sentinel Security Monitoring Tool"
+LABEL version="0.2.0"
+LABEL description="Rust-based Linux Sentinel Security Monitoring Tool"
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    bpfcc-tools \
-    libbpfcc \
-    yara \
-    netcat-openbsd \
-    curl \
-    jq \
-    inotify-tools \
-    procps \
-    psmisc \
-    net-tools \
-    lsof \
-    iproute2 \
-    systemd \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+RUN \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        libbpf-dev \
+        libyara-dev \
+        curl \
+        netcat-openbsd \
+        inotify-tools \
+        procps \
+        psmisc \
+        net-tools \
+        lsof \
+        iproute2; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir --break-system-packages \
-    bcc==0.24.0
-
-COPY linux_sentinel.py /opt/linux-sentinel/linux_sentinel.py
-COPY sentinel.conf /opt/linux-sentinel/sentinel.conf
+COPY --from=builder /usr/src/linux-sentinel/target/release/linux-sentinel /opt/linux-sentinel/linux-sentinel
+COPY master.toml /opt/linux-sentinel/master.toml
+COPY rules.yara /opt/linux-sentinel/rules.yara
 
 WORKDIR /opt/linux-sentinel
 
-RUN mkdir -p /var/log/linux-sentinel /var/backups/linux-sentinel \
-    && chown -R nobody:nogroup /var/log/linux-sentinel /var/backups/linux-sentinel \
-    && chmod -R 750 /var/log/linux-sentinel /var/backups/linux-sentinel \
-    && chmod 755 /opt/linux-sentinel/linux_sentinel.py
+RUN \
+    mkdir -p /var/log/linux-sentinel /var/backups/linux-sentinel; \
+    chown -R nobody:nogroup /var/log/linux-sentinel /var/backups/linux-sentinel; \
+    chmod -R 750 /var/log/linux-sentinel /var/backups/linux-sentinel; \
+    chmod 755 /opt/linux-sentinel/linux-sentinel
 
 USER nobody
-RUN setcap cap_net_admin,cap_dac_read_search,cap_sys_ptrace+ep /opt/linux-sentinel/linux_sentinel.py
+RUN setcap cap_net_admin,cap_dac_read_search,cap_sys_ptrace+ep /opt/linux-sentinel/linux-sentinel
 
-ENV PYTHONUNBUFFERED=1 \
-    DASHBOARD_PORT=8080 \
-    PATH=/opt/linux-sentinel:$PATH
+ENV DASHBOARD_PORT=8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://127.0.0.1:${DASHBOARD_PORT}/api/status || exit 1
 
-ENTRYPOINT ["python3", "/opt/linux-sentinel/linux_sentinel.py"]
+ENTRYPOINT ["/opt/linux-sentinel/linux-sentinel"]
 CMD ["enhanced"]
 
 EXPOSE 8080

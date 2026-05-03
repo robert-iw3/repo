@@ -20,15 +20,17 @@ spec:
         image: linux-sentinel:latest
         imagePullPolicy: IfNotPresent
         command: ["/opt/linux-sentinel/linux-sentinel"]
-        args: ["enhanced"]
         securityContext:
-          runAsUser: 65534 # nobody
-          runAsGroup: 65534 # nogroup
+          privileged: true
           capabilities:
             add:
             - NET_ADMIN
             - DAC_READ_SEARCH
             - SYS_PTRACE
+            - SYS_ADMIN
+            - SYS_RESOURCE
+            - BPF
+            - PERFMON
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
         ports:
@@ -53,17 +55,17 @@ spec:
           httpGet:
             path: /api/status
             port: api
-          initialDelaySeconds: 10
-          periodSeconds: 20 # Reduced frequency
-          timeoutSeconds: 2
+          initialDelaySeconds: 20 # Increased for eBPF map allocation
+          periodSeconds: 20
+          timeoutSeconds: 5     # Increased to prevent K8s timeouts during SQLite bursts
           failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /api/status
             port: api
-          initialDelaySeconds: 5
+          initialDelaySeconds: 15 # Increased for YARA compilation
           periodSeconds: 10
-          timeoutSeconds: 2
+          timeoutSeconds: 5
           failureThreshold: 3
       volumes:
       - name: log-volume

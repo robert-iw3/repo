@@ -1,19 +1,18 @@
-[Unit]
-Description=Linux Sentinel v2.3 Security Monitor
-After=network.target
-
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/python3 /opt/linux-sentinel/linux_sentinel.py enhanced
+Type=simple
+ExecStart=/opt/linux-sentinel/linux-sentinel
 User=root
+Group=nogroup
 StandardOutput=journal
 StandardError=journal
 Restart=on-failure
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+
+LimitMEMLOCK=infinity
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE
+
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

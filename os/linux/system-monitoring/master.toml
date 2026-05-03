@@ -1,0 +1,51 @@
+[engine]
+enable_ebpf = true
+enable_yara = true
+enable_honeypots = true
+enable_anti_evasion = true
+performance_mode = false
+
+[monitoring]
+monitor_network = true
+monitor_processes = true
+monitor_files = true
+monitor_users = true
+monitor_rootkits = true
+monitor_memory = true
+
+[storage]
+central_log_dir = "/var/log/linux-sentinel/diagnostics"
+output_dir = "/var/log/linux-sentinel/Behavior/Categories"
+sqlite_db_path = "/var/log/linux-sentinel/sentinel.db"
+
+[siem]
+# Configure your middleware gateway here
+middleware_gateway_url = "http://127.0.0.1:8080/api/ingest"
+auth_token = "your_auth_token_here"
+batch_size = 100
+
+[network]
+whitelist_connections = [
+    "127.0.0.1", "::1", "0.0.0.0", "8.8.8.8", "1.1.1.1",
+    "208.67.222.222", "1.0.0.1", "9.9.9.9"
+]
+
+[process]
+whitelist_processes = [
+    "firefox", "chrome", "nmap", "masscan", "nuclei", "gobuster",
+    "ffuf", "subfinder", "httpx", "amass", "burpsuite", "wireshark",
+    "metasploit", "sqlmap", "nikto", "dirb", "wpscan", "john",
+    "docker", "containerd", "systemd", "kthreadd", "bash", "zsh",
+    "ssh", "python3", "yara"
+]
+
+[files]
+exclude_paths = [
+    "/opt/metasploit-framework", "/usr/share/metasploit-framework",
+    "/usr/share/wordlists", "/home/*/go/bin", "/tmp/nuclei-templates",
+    "/var/lib/docker", "/var/lib/containerd", "/snap"
+]
+critical_paths = [
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers",
+    "/etc/ssh/sshd_config", "/etc/hosts"
+]
