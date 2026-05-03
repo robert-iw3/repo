@@ -3,6 +3,7 @@ enable_ebpf = true
 enable_yara = true
 enable_honeypots = true
 enable_anti_evasion = true
+enable_active_mitigation = false
 performance_mode = false
 
 [monitoring]

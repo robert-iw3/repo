@@ -1,12 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: linux-sentinel
   namespace: security
   labels:
     app: linux-sentinel
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: linux-sentinel

@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
     // 2. High-Throughput Backpressure Channel (100,000 Event Depth)
     let (alert_tx, alert_rx) = mpsc::channel::<SecurityAlert>(100_000);
 
+    let (kill_tx, kill_rx) = mpsc::unbounded_channel::<u32>();
+
     // 3. SIEM Transmission & Local SQLite Storage Worker
     info!("Mounting SQLite Telemetry Engine & SIEM Forwarder...");
     let transmitter = Arc::new(
@@ -84,7 +86,7 @@ async fn main() -> Result<()> {
         let alert_tx_scan = alert_tx.clone();
         let config_scan = config.clone();
         async_tasks.push(tokio::spawn(async move {
-            let engine = ScannerEngine::new(config_scan, raw_rx, alert_tx_scan);
+            let engine = ScannerEngine::new(config_scan, raw_rx, alert_tx_scan, kill_tx);
             engine.run().await;
         }));
     } else if config.engine.enable_ebpf {
@@ -125,7 +127,7 @@ async fn main() -> Result<()> {
             let max_retries = 10;
             loop {
                 info!("(Re)Starting Native eBPF Telemetry Engine...");
-                let engine = EbpfEngine::new(raw_tx_ebpf.clone());
+                let engine = EbpfEngine::new(raw_tx_ebpf.clone(), kill_rx);
 
                 if let Err(e) = engine.run() {
                     error!("eBPF Engine encountered a critical kernel fault: {}", e);

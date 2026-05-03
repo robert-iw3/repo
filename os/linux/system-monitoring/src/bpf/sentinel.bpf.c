@@ -5,7 +5,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define MAX_FILENAME 256
+#define MAX_FILENAME 512
 #define MAX_PAYLOAD 64
 
 // Linux Event Mapping
@@ -48,6 +48,22 @@ struct {
     __type(value, u64); // Last Timestamp
 } proc_timestamps SEC(".maps");
 
+// ACTIVE MITIGATION MAP: Fed asynchronously from the Rust UEBA brain
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u32);   // Malicious PID
+    __type(value, u32); // Kill Flag (1)
+} kill_list SEC(".maps");
+
+// Instantly fires SIGKILL (9) from ring 0 if the PID is flagged
+#define ENFORCE_MITIGATION(pid) do { \
+    u32 *kill_flag = bpf_map_lookup_elem(&kill_list, &pid); \
+    if (kill_flag && *kill_flag == 1) { \
+        bpf_send_signal(9); \
+    } \
+} while(0)
+
 #define POPULATE_CORE(evt, e_type) do { \
     evt->ts_ns = bpf_ktime_get_ns(); \
     evt->pid = bpf_get_current_pid_tgid() >> 32; \
@@ -73,8 +89,27 @@ int tp__sys_enter_execve(struct trace_event_raw_sys_enter *ctx) {
     if (!evt) return 0;
 
     POPULATE_CORE(evt, EVENT_EXEC);
-    const char *argp = (const char *)ctx->args[0];
-    bpf_probe_read_user_str(&evt->target, sizeof(evt->target), argp);
+    ENFORCE_MITIGATION(evt->pid);
+
+    const char **argv = (const char **)(ctx->args[1]);
+    int offset = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        const char *argp;
+        if (bpf_probe_read_user(&argp, sizeof(argp), &argv[i]) != 0 || !argp) break;
+
+        int sz = bpf_probe_read_user_str(&evt->target[offset], MAX_FILENAME - offset, argp);
+        if (sz > 1) {
+            offset += sz - 1; // Overwrite the null terminator
+            if (offset < MAX_FILENAME - 1) {
+                evt->target[offset++] = ' '; // Inject space between arguments
+            } else {
+                break;
+            }
+        }
+    }
+    if (offset > 0) evt->target[offset - 1] = '\0'; // Seal the final string
 
     bpf_ringbuf_submit(evt, 0);
     return 0;
@@ -93,7 +128,7 @@ int tp__sys_enter_openat(struct trace_event_raw_sys_enter *ctx) {
         POPULATE_CORE(evt, EVENT_OPEN_CRIT);
         const char *argp = (const char *)ctx->args[1];
         bpf_probe_read_user_str(&evt->target, sizeof(evt->target), argp);
-
+        ENFORCE_MITIGATION(evt->pid);
         bpf_ringbuf_submit(evt, 0);
     }
     return 0;
@@ -163,6 +198,22 @@ int tp__sys_enter_ptrace(struct trace_event_raw_sys_enter *ctx) {
 // 7. C2 & Exfiltration (Outbound TCP)
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(tcp_v4_connect, struct sock *sk) {
+    struct event_t *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
+    if (!evt) return 0;
+
+    POPULATE_CORE(evt, EVENT_CONNECT);
+    BPF_CORE_READ_INTO(&evt->daddr, sk, __sk_common.skc_daddr);
+    BPF_CORE_READ_INTO(&evt->dport, sk, __sk_common.skc_dport);
+    ENFORCE_MITIGATION(evt->pid);
+    bpf_ringbuf_submit(evt, 0);
+    return 0;
+}
+
+// 7b. Bind Shells & Inbound Attack Vectors (Inbound TCP)
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(inet_csk_accept_ret, struct sock *sk) {
+    if (!sk) return 0;
+
     struct event_t *evt = bpf_ringbuf_reserve(&events, sizeof(*evt), 0);
     if (!evt) return 0;
 

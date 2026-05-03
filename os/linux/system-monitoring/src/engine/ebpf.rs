@@ -19,7 +19,7 @@ struct event_t {
     uid: u32,
     event_type: u32,
     comm: [u8; 16],
-    target: [u8; 256],
+    target: [u8; 512],
     daddr: u32,
     dport: u16,
     payload: [u8; 64],
@@ -27,14 +27,15 @@ struct event_t {
 
 pub struct EbpfEngine {
     raw_tx: mpsc::Sender<RawKernelEvent>,
+    kill_rx: mpsc::UnboundedReceiver<u32>,
 }
 
 impl EbpfEngine {
-    pub fn new(raw_tx: mpsc::Sender<RawKernelEvent>) -> Self {
-        Self { raw_tx }
+    pub fn new(raw_tx: mpsc::Sender<RawKernelEvent>, kill_rx: mpsc::UnboundedReceiver<u32>) -> Self {
+        Self { raw_tx, kill_rx }
     }
 
-    pub fn run(self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         info!("Loading Native eBPF CO-RE skeleton...");
         let skel_builder = SentinelSkelBuilder::default();
         let open_skel = skel_builder.open().context("Failed to open BPF skeleton")?;
@@ -82,6 +83,17 @@ impl EbpfEngine {
         loop {
             // Unmanaged OS thread blocking poll; yields to kernel, consumes 0% CPU while idle
             ring_buf.poll(std::time::Duration::from_millis(50))?;
+
+            // NON-BLOCKING MAP UPDATE: Safely update kernel maps across the FFI boundary
+            while let Ok(pid) = self.kill_rx.try_recv() {
+                let pid_bytes = pid.to_ne_bytes();
+                let flag_bytes = 1u32.to_ne_bytes();
+                if let Err(e) = skel.maps_mut().kill_list().update(&pid_bytes, &flag_bytes, libbpf_rs::MapFlags::ANY) {
+                    error!("FATAL: Failed to update eBPF kill_list map for PID {}: {}", pid, e);
+                } else {
+                    info!("ACTIVE MITIGATION ARMED: PID {} added to kernel kill list.", pid);
+                }
+            }
         }
     }
 }

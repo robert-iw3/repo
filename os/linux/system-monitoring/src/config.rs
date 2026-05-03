@@ -18,6 +18,8 @@ pub struct EngineConfig {
     pub enable_yara: bool,
     pub enable_honeypots: bool,
     pub enable_anti_evasion: bool,
+    #[serde(default)]
+    pub enable_active_mitigation: bool,
     #[serde(default = "default_true")]
     pub enable_api_server: bool,
     pub performance_mode: bool,

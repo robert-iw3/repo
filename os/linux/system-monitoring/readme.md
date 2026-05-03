@@ -121,7 +121,7 @@ curl -H "Authorization: Bearer <your_token>" http://127.0.0.1:8080/api/alerts
 
 ---
 
-## Roadmap (The Horizon)
+## Roadmap (The Horizon) **CURRENT SCOPE IN-PROG**
 * **AST Parsing:** Native compilation of Sigma rules into the Rust behavioral engine.
 * **Extended TTP Signatures:** Complex multi-event correlation (e.g., detect `memfd_create` followed by `udp_sendmsg`).
 * **Process Tree Visualization:** Native graph-based lineage in the dashboard.
